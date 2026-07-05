@@ -1,0 +1,16 @@
+{
+  "profiles": {
+    "https": {
+      "commandName": "Project",
+      "dotnetRunMessages": true,
+      "launchBrowser": true,
+      "applicationUrl": "https://localhost:17168;http://localhost:15130",
+      "environmentVariables": {
+        "ASPNETCORE_ENVIRONMENT": "Development",
+        "DOTNET_ENVIRONMENT": "Development",
+        "DOTNET_DASHBOARD_OTLP_ENDPOINT_URL": "https://localhost:21168",
+        "DOTNET_RESOURCE_SERVICE_ENDPOINT_URL": "https://localhost:22064"
+      }
+    }
+  }
+}

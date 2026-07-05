@@ -1,0 +1,17 @@
+﻿<Project Sdk="Aspire.AppHost.Sdk/13.4.6">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <UserSecretsId>e074a7b0-de4c-460f-84ad-e68747a3f15c</UserSecretsId>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Aspire.Hosting.Foundry" Version="13.4.6-preview.1.26319.6" />
+    <ProjectReference Include="..\SquadifyDemo\SquadifyDemo.csproj" />
+    <ProjectReference Include="..\src\CommunityToolkit.Aspire.Hosting.Squad\CommunityToolkit.Aspire.Hosting.Squad.csproj" IsAspireProjectResource="false" />
+  </ItemGroup>
+
+</Project>

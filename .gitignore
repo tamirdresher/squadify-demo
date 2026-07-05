@@ -1,0 +1,21 @@
+.env
+.vs/
+bin/
+obj/
+reflect-tool/
+*.csx
+*.user
+
+# Nested squad state (defensive)
+.squad/.squad/
+
+# Squad runtime state — not source, regenerated at runtime
+**/session-state/
+**/session-store.db
+**/session-store.db-*
+
+# Throwaway diagnostics / repro scratch
+_trace-repro/
+
+# Presentation deck lives in OneDrive, not the repo
+*.pptx

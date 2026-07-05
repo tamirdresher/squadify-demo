@@ -1,0 +1,430 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Squadify Demo – Incident Response</title>
+    <style>
+        :root {
+            --bg: #1e1e2e;
+            --surface: #262637;
+            --border: #3a3a5c;
+            --text: #e0e0f0;
+            --muted: #8888aa;
+            --accent: #4ec9b0;
+            --accent-hover: #6ae0c8;
+            --danger: #f44747;
+            --warning: #dcdcaa;
+            --success: #6a9955;
+            --code-bg: #1a1a2a;
+        }
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: 'Segoe UI', system-ui, sans-serif;
+            background: var(--bg);
+            color: var(--text);
+            min-height: 100vh;
+            padding: 2rem;
+        }
+        h1 {
+            font-size: 1.8rem;
+            font-weight: 600;
+            margin-bottom: 0.5rem;
+            color: var(--accent);
+        }
+        .subtitle {
+            color: var(--muted);
+            margin-bottom: 2rem;
+            font-size: 0.9rem;
+        }
+        .container {
+            max-width: 1000px;
+            margin: 0 auto;
+        }
+        .panel {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 1.5rem;
+            margin-bottom: 1.5rem;
+        }
+        .panel h2 {
+            font-size: 1.1rem;
+            margin-bottom: 1rem;
+            color: var(--text);
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+        .form-row {
+            display: flex;
+            gap: 1rem;
+            align-items: flex-end;
+            flex-wrap: wrap;
+        }
+        .form-group {
+            display: flex;
+            flex-direction: column;
+            gap: 0.3rem;
+        }
+        .form-group label {
+            font-size: 0.8rem;
+            color: var(--muted);
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+        }
+        input, select, textarea {
+            background: var(--code-bg);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            color: var(--text);
+            padding: 0.6rem 0.8rem;
+            font-size: 0.9rem;
+            font-family: inherit;
+        }
+        input:focus, select:focus, textarea:focus {
+            outline: none;
+            border-color: var(--accent);
+        }
+        textarea { resize: vertical; min-height: 60px; width: 100%; }
+        select { min-width: 140px; }
+        .btn {
+            background: var(--accent);
+            color: #1e1e2e;
+            border: none;
+            border-radius: 6px;
+            padding: 0.6rem 1.5rem;
+            font-size: 0.9rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+        .btn:hover { background: var(--accent-hover); }
+        .btn:disabled { background: var(--border); cursor: not-allowed; color: var(--muted); }
+        .btn-secondary {
+            background: transparent;
+            border: 1px solid var(--border);
+            color: var(--text);
+        }
+        .btn-secondary:hover { border-color: var(--accent); color: var(--accent); }
+
+        /* Status indicator */
+        .status-bar {
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+            padding: 0.75rem 1rem;
+            border-radius: 8px;
+            background: var(--code-bg);
+            margin-bottom: 1rem;
+        }
+        .status-dot {
+            width: 10px; height: 10px;
+            border-radius: 50%;
+            background: var(--muted);
+        }
+        .status-dot.running { background: var(--warning); animation: pulse 1s infinite; }
+        .status-dot.completed { background: var(--success); }
+        .status-dot.failed { background: var(--danger); }
+        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
+
+        /* Results */
+        .results-container {
+            max-height: 500px;
+            overflow-y: auto;
+            padding-right: 0.5rem;
+        }
+        .step-card {
+            background: var(--code-bg);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 1rem;
+            margin-bottom: 0.75rem;
+        }
+        .step-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 0.5rem;
+        }
+        .step-name {
+            font-weight: 600;
+            color: var(--accent);
+            font-size: 0.9rem;
+        }
+        .step-type {
+            font-size: 0.75rem;
+            color: var(--muted);
+            background: var(--surface);
+            padding: 0.2rem 0.5rem;
+            border-radius: 4px;
+        }
+        .step-output {
+            font-family: 'Cascadia Code', 'Fira Code', monospace;
+            font-size: 0.8rem;
+            color: var(--text);
+            white-space: pre-wrap;
+            line-height: 1.5;
+            max-height: 200px;
+            overflow-y: auto;
+        }
+        .final-result {
+            background: linear-gradient(135deg, #1a2a1a, #1a2a2a);
+            border-color: var(--success);
+        }
+        .empty-state {
+            text-align: center;
+            padding: 3rem;
+            color: var(--muted);
+        }
+        .demo-badges {
+            display: flex;
+            gap: 0.5rem;
+            margin-top: 0.5rem;
+        }
+        .badge {
+            font-size: 0.7rem;
+            padding: 0.2rem 0.5rem;
+            border-radius: 4px;
+            background: var(--surface);
+            border: 1px solid var(--border);
+            color: var(--muted);
+        }
+        .badge.active { border-color: var(--accent); color: var(--accent); }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🚨 Squadify Demo – Incident Response</h1>
+        <p class="subtitle">
+            Microsoft Agent Framework + Squad AI — trigger an incident and watch the multi-agent workflow run
+        </p>
+
+        <!-- Trigger Panel -->
+        <div class="panel">
+            <h2>⚡ Trigger Incident</h2>
+            <div class="form-row">
+                <div class="form-group" style="flex:1">
+                    <label>Incident Description</label>
+                    <input type="text" id="incidentTitle"
+                        value="Checkout failures spiking on PaymentService. Error rate > 50%"
+                        placeholder="Describe the incident...">
+                </div>
+                <div class="form-group">
+                    <label>Severity</label>
+                    <select id="severity">
+                        <option value="Sev1">Sev1 – Critical</option>
+                        <option value="Sev2" selected>Sev2 – High</option>
+                        <option value="Sev3">Sev3 – Medium</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label>Demo</label>
+                    <select id="demoNumber">
+                        <option value="1">Demo 1 – Single Agent</option>
+                        <option value="2">Demo 2 – MAF Workflow</option>
+                        <option value="3" selected>Demo 3 – Squad + MAF</option>
+                    </select>
+                </div>
+                <button class="btn" id="triggerBtn" onclick="triggerIncident()">
+                    🚀 Run Workflow
+                </button>
+            </div>
+            <div class="demo-badges" id="demoBadges">
+                <span class="badge">Demo 1: Single agent with tools</span>
+                <span class="badge">Demo 2: Sequential MAF workflow</span>
+                <span class="badge active">Demo 3: Squad multi-agent + deterministic code</span>
+            </div>
+        </div>
+
+        <!-- Status Panel -->
+        <div class="panel">
+            <h2>📊 Workflow Status</h2>
+            <div class="status-bar" id="statusBar">
+                <div class="status-dot" id="statusDot"></div>
+                <span id="statusText">Ready — waiting for incident</span>
+            </div>
+
+            <!-- Steps/Results -->
+            <div class="results-container" id="resultsContainer">
+                <div class="empty-state" id="emptyState">
+                    <p>🎯 Trigger an incident above to see the workflow steps appear here in real-time</p>
+                    <p style="margin-top:0.5rem; font-size:0.8rem;">
+                        Demo 3 will show Squad dispatching LogAnalyzer and Remediator subagents
+                    </p>
+                </div>
+            </div>
+        </div>
+
+        <!-- Quick Actions -->
+        <div style="display:flex; gap:0.75rem; flex-wrap:wrap;">
+            <button class="btn btn-secondary" onclick="viewTraces()">📋 View All Traces</button>
+            <button class="btn btn-secondary" onclick="checkHealth()">💚 Health Check</button>
+            <button class="btn btn-secondary" onclick="clearResults()">🗑️ Clear</button>
+        </div>
+    </div>
+
+    <script>
+        let pollInterval = null;
+        let currentRunId = null;
+
+        function triggerIncident() {
+            const title = document.getElementById('incidentTitle').value;
+            const severity = document.getElementById('severity').value;
+            const demo = document.getElementById('demoNumber').value;
+
+            const btn = document.getElementById('triggerBtn');
+            btn.disabled = true;
+            btn.textContent = '⏳ Running...';
+
+            clearResults();
+            setStatus('running', `Running Demo ${demo}...`);
+
+            const params = new URLSearchParams({ title, severity, demo });
+            fetch(`/incidents/simulate?${params}`, { method: 'POST' })
+                .then(r => r.json())
+                .then(data => {
+                    currentRunId = data.incident?.id;
+                    startPolling();
+                })
+                .catch(err => {
+                    setStatus('failed', `Error: ${err.message}`);
+                    btn.disabled = false;
+                    btn.textContent = '🚀 Run Workflow';
+                });
+        }
+
+        function startPolling() {
+            if (pollInterval) clearInterval(pollInterval);
+            pollInterval = setInterval(async () => {
+                try {
+                    const res = await fetch('/status');
+                    const data = await res.json();
+
+                    if (data.status === 'Running') {
+                        setStatus('running', data.message);
+                    } else if (data.status === 'Completed') {
+                        setStatus('completed', '✅ Workflow completed!');
+                        stopPolling();
+                        loadTraceResults();
+                    } else if (data.status === 'Failed') {
+                        setStatus('failed', `❌ ${data.message}`);
+                        stopPolling();
+                    }
+                } catch (e) { /* ignore transient fetch errors */ }
+            }, 1500);
+        }
+
+        function stopPolling() {
+            if (pollInterval) { clearInterval(pollInterval); pollInterval = null; }
+            const btn = document.getElementById('triggerBtn');
+            btn.disabled = false;
+            btn.textContent = '🚀 Run Workflow';
+        }
+
+        async function loadTraceResults() {
+            try {
+                const res = await fetch('/trace');
+                const runs = await res.json();
+                if (runs.length === 0) return;
+
+                const latest = runs[runs.length - 1];
+                renderResults(latest);
+            } catch (e) { console.error(e); }
+        }
+
+        function renderResults(run) {
+            const container = document.getElementById('resultsContainer');
+            document.getElementById('emptyState')?.remove();
+
+            let html = '';
+
+            if (run.steps && run.steps.length > 0) {
+                for (const step of run.steps) {
+                    const typeClass = step.type === 'squad-analysis' ? 'active' : '';
+                    html += `
+                        <div class="step-card ${step.step === 'FinalResult' ? 'final-result' : ''}">
+                            <div class="step-header">
+                                <span class="step-name">${getStepIcon(step.type)} ${step.step}</span>
+                                <span class="step-type ${typeClass}">${step.type}</span>
+                            </div>
+                            <div class="step-output">${escapeHtml(step.output)}</div>
+                        </div>`;
+                }
+            }
+
+            if (run.finalResult) {
+                html += `
+                    <div class="step-card final-result">
+                        <div class="step-header">
+                            <span class="step-name">🏁 Final Result</span>
+                            <span class="step-type">duration: ${run.durationMs ? Math.round(run.durationMs/1000) + 's' : '—'}</span>
+                        </div>
+                        <div class="step-output">${escapeHtml(run.finalResult)}</div>
+                    </div>`;
+            }
+
+            container.innerHTML = html;
+        }
+
+        function getStepIcon(type) {
+            switch (type) {
+                case 'deterministic': return '⚙️';
+                case 'squad-analysis': return '🤖';
+                case 'maf-agent': return '🧠';
+                default: return '📌';
+            }
+        }
+
+        function setStatus(state, message) {
+            const dot = document.getElementById('statusDot');
+            const text = document.getElementById('statusText');
+            dot.className = 'status-dot ' + state;
+            text.textContent = message;
+        }
+
+        function clearResults() {
+            document.getElementById('resultsContainer').innerHTML = `
+                <div class="empty-state" id="emptyState">
+                    <p>🎯 Trigger an incident above to see the workflow steps appear here in real-time</p>
+                    <p style="margin-top:0.5rem; font-size:0.8rem;">
+                        Demo 3 will show Squad dispatching LogAnalyzer and Remediator subagents
+                    </p>
+                </div>`;
+            setStatus('', 'Ready — waiting for incident');
+        }
+
+        async function viewTraces() {
+            const res = await fetch('/trace');
+            const runs = await res.json();
+            if (runs.length === 0) {
+                alert('No trace data yet. Run a workflow first!');
+                return;
+            }
+            // Show latest trace
+            renderResults(runs[runs.length - 1]);
+        }
+
+        async function checkHealth() {
+            try {
+                const res = await fetch('/health');
+                const text = await res.text();
+                setStatus('completed', `💚 Health: ${text}`);
+            } catch (e) {
+                setStatus('failed', `Health check failed: ${e.message}`);
+            }
+        }
+
+        function escapeHtml(str) {
+            if (!str) return '';
+            return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+        }
+
+        // Update badge highlighting based on demo selection
+        document.getElementById('demoNumber').addEventListener('change', (e) => {
+            const badges = document.querySelectorAll('.demo-badges .badge');
+            badges.forEach((b, i) => b.classList.toggle('active', i === parseInt(e.target.value) - 1));
+        });
+    </script>
+</body>
+</html>

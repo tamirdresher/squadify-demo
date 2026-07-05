@@ -1,0 +1,5 @@
+<Solution>
+  <Project Path="src/CommunityToolkit.Aspire.Hosting.Squad/CommunityToolkit.Aspire.Hosting.Squad.csproj" />
+  <Project Path="SquadifyDemo.AppHost/SquadifyDemo.AppHost.csproj" />
+  <Project Path="SquadifyDemo/SquadifyDemo.csproj" />
+</Solution>

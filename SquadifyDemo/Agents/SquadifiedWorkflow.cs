@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using Microsoft.Agents.AI;
 using Microsoft.Agents.AI.Workflows;
@@ -212,6 +213,13 @@ public static class SquadifiedWorkflow
             // executor-invocation span the ambient Activity.Current during HandleAsync, so we start our own.
             using var squadActivity = s_workflowSource.StartActivity("squad-analysis");
 
+            // Option B — live child spans, one per sub-agent tool call. The Squad SDK raises
+            // ToolStart/ToolComplete trace events (out-of-process, on the CLI subprocess). We turn
+            // each into an OTel span parented to squadActivity so the Aspire trace view shows what
+            // the team is *doing* while it runs — not just an opaque "squad-analysis" span.
+            // Keyed by ToolCallId so ToolStart and ToolComplete correlate.
+            var toolSpans = new ConcurrentDictionary<string, Activity>();
+
             var builder = Host.CreateApplicationBuilder();
             builder.Logging.SetMinimumLevel(LogLevel.Warning);
             builder.Services.AddSquadAgent(o =>
@@ -224,10 +232,20 @@ public static class SquadifiedWorkflow
                     "Use agent_type: 'general-purpose' and mode: 'background' for each. " +
                     "Analyze this production alert, identify root cause, assess blast radius, and provide actionable remediation steps.";
                 o.EmitSubagentActivities = true;
+                // Option C — fine-grained trace events (tool calls + assistant messages), not just
+                // sub-agent lifecycle. Required for ToolStart/ToolComplete/AssistantMessage to fire.
+                o.TraceEvents = true;
                 o.OnSubagentTrace = evt =>
                 {
                     switch (evt.Kind)
                     {
+                        case SquadAgentTraceEventKind.SubagentSelected:
+                            _logger.LogInformation("[Squad] 🎯 Selected: {Name} — tools: {Tools}",
+                                evt.DispatchedPersonaName ?? evt.SubagentName ?? "(coordinator)",
+                                evt.RequestedToolNames is { Count: > 0 }
+                                    ? string.Join(", ", evt.RequestedToolNames)
+                                    : "(none)");
+                            break;
                         case SquadAgentTraceEventKind.SubagentDispatched:
                             _logger.LogInformation("[Squad] 📤 Dispatching: {Name} ({Type})",
                                 evt.DispatchedPersonaName, evt.DispatchedAgentType);
@@ -241,6 +259,51 @@ public static class SquadifiedWorkflow
                         case SquadAgentTraceEventKind.SubagentFailed:
                             _logger.LogWarning("[Squad] ❌ Failed: {Name}", evt.SubagentName);
                             break;
+                        case SquadAgentTraceEventKind.AssistantMessage:
+                            if (!string.IsNullOrWhiteSpace(evt.Content))
+                                _logger.LogInformation("[Squad] 💬 {Name}: {Message}",
+                                    evt.SubagentName ?? "coordinator", Trim(evt.Content));
+                            break;
+                        case SquadAgentTraceEventKind.ToolStart:
+                        {
+                            var toolName = ResolveToolName(evt);
+                            _logger.LogInformation("[Squad] 🔧 Tool start: {Tool} (subagent: {Sub})",
+                                toolName, evt.SubagentName ?? "coordinator");
+
+                            // Parent explicitly — the callback may run off the ambient Activity.Current.
+                            var toolActivity = s_workflowSource.StartActivity(
+                                $"tool:{toolName}", ActivityKind.Internal, squadActivity?.Context ?? default);
+                            if (toolActivity is not null)
+                            {
+                                toolActivity.SetTag("squad.subagent", evt.SubagentName);
+                                toolActivity.SetTag("squad.subagent.display", evt.SubagentDisplayName);
+                                toolActivity.SetTag("squad.tool", toolName);
+                                toolActivity.SetTag("squad.tool_call_id", evt.ToolCallId);
+                                if (!string.IsNullOrWhiteSpace(evt.Content))
+                                    toolActivity.SetTag("squad.tool.args", Trim(evt.Content, 400));
+
+                                if (!string.IsNullOrEmpty(evt.ToolCallId))
+                                    toolSpans[evt.ToolCallId] = toolActivity;
+                                else
+                                    toolActivity.Dispose(); // no correlation id — close immediately
+                            }
+                            break;
+                        }
+                        case SquadAgentTraceEventKind.ToolComplete:
+                        {
+                            var toolName = ResolveToolName(evt);
+                            _logger.LogInformation("[Squad] ✔️  Tool done: {Tool} (success: {Success})",
+                                toolName, evt.Success?.ToString() ?? "n/a");
+
+                            if (!string.IsNullOrEmpty(evt.ToolCallId)
+                                && toolSpans.TryRemove(evt.ToolCallId, out var toolActivity))
+                            {
+                                toolActivity.SetStatus(
+                                    evt.Success == false ? ActivityStatusCode.Error : ActivityStatusCode.Ok);
+                                toolActivity.Dispose();
+                            }
+                            break;
+                        }
                     }
                 };
             });
@@ -273,12 +336,31 @@ public static class SquadifiedWorkflow
             }
             finally
             {
+                // Dispose any tool spans that never received a ToolComplete (e.g. cancellation).
+                foreach (var leftover in toolSpans.Values)
+                    leftover.Dispose();
+                toolSpans.Clear();
+
                 if (squad is IAsyncDisposable asyncDisposable)
                     await asyncDisposable.DisposeAsync();
             }
 
             return analysisResult;
         }
+
+        /// <summary>Picks a human-readable tool name from whichever fields the SDK populated.</summary>
+        private static string ResolveToolName(SquadAgentTraceEvent evt)
+        {
+            if (evt.RequestedToolNames is { Count: > 0 })
+                return string.Join("+", evt.RequestedToolNames);
+            if (!string.IsNullOrWhiteSpace(evt.SubagentName))
+                return evt.SubagentName!;
+            return "call";
+        }
+
+        /// <summary>Truncates long trace content so spans/logs stay readable.</summary>
+        private static string Trim(string s, int max = 160)
+            => s.Length <= max ? s : string.Concat(s.AsSpan(0, max), "…");
     }
 
     /// <summary>

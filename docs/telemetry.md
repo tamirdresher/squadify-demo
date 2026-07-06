@@ -118,7 +118,10 @@ conversation is the Squad's *entire* internal exchange, end to end:
 
 - `gen_ai.operation.name = "chat"` — the flag that tells the dashboard to show the AI-details panel.
 - `gen_ai.provider.name = "squad"`, `gen_ai.request.model` — provider/model labels.
-- `gen_ai.system_instructions` — the coordinator's system prompt.
+- `gen_ai.system_instructions` — the coordinator's system prompt. **Must be JSON-encoded** as an
+  array of text parts (`[{"type":"text","content":"..."}]`), *not* a raw string — the dashboard parses
+  this attribute as strict JSON and a bare string like `"You are..."` throws `JsonReaderException` and
+  blocks the whole panel. Use the `GenAi.SystemInstructionsJson(...)` helper.
 - `gen_ai.input.messages` — what we sent the coordinator (system instructions + the validated alert).
 - `gen_ai.output.messages` — the **live transcript**: every coordinator turn, each sub-agent
   dispatch/tool call, each tool response, and every assistant message, appended in arrival order as

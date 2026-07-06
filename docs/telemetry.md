@@ -111,6 +111,26 @@ running commentary of what each sub-agent is doing while it works.
 Together, B + C turn the opaque "Squad is thinking" period into a visible, inspectable timeline of
 tool calls and messages.
 
+**(D) Full end-to-end chat in the "AI details" view.** The `squad-analysis` span is decorated with
+the OpenTelemetry **GenAI semantic-convention** attributes, so the Aspire dashboard renders it in the
+same **"AI details" chat visualizer** it uses for an in-process `ChatClientAgent` — except here the
+conversation is the Squad's *entire* internal exchange, end to end:
+
+- `gen_ai.operation.name = "chat"` — the flag that tells the dashboard to show the AI-details panel.
+- `gen_ai.provider.name = "squad"`, `gen_ai.request.model` — provider/model labels.
+- `gen_ai.system_instructions` — the coordinator's system prompt.
+- `gen_ai.input.messages` — what we sent the coordinator (system instructions + the validated alert).
+- `gen_ai.output.messages` — the **live transcript**: every coordinator turn, each sub-agent
+  dispatch/tool call, each tool response, and every assistant message, appended in arrival order as
+  the run progresses (guarded by a lock because callbacks fire from parallel sub-agent threads).
+
+The message JSON matches `Microsoft.Extensions.AI`'s `OpenTelemetryChatClient` shape (snake_case
+`parts`: `text`, `tool_call`, `tool_call_response`), which is what the dashboard's parser expects. The
+result: opening the `squad-analysis` span in the Aspire GenAI view shows the whole
+coordinator → sub-agent → coordinator conversation as a chat, not just the final report. This closes
+the gap noted above — the Copilot CLI's reasoning is out-of-process, but the SDK's trace events give us
+enough to reconstruct and surface the conversation as a first-class GenAI chat.
+
 > **`SquadAgentTraceEventKind` values** (SDK 0.5.5): `AssistantMessage`, `Other`, `SessionIdle`,
 > `SubagentCompleted`, `SubagentDispatched`, `SubagentFailed`, `SubagentSelected`, `SubagentStarted`,
 > `ToolComplete`, `ToolStart`.

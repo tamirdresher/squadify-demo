@@ -9,6 +9,7 @@ using SquadifyDemo.Agents;
 using System.Diagnostics;
 using System.Diagnostics.Metrics;
 using System.Threading.Channels;
+using System.Collections.Concurrent;
 
 namespace SquadifyDemo;
 
@@ -60,6 +61,16 @@ public static class SquadifyWebProgram
         builder.Services.AddSingleton<WorkflowRunnerState>();
         builder.Services.AddSingleton<WorkflowTraceStore>();
         builder.Services.AddSingleton<WorkflowTrigger>();
+
+        // Warm pool of pre-built Squad agents (cold-start optimization). Size is
+        // capped by SQUAD_POOL_SIZE (default 3) and also caps Squad run concurrency.
+        var poolSize = int.TryParse(Environment.GetEnvironmentVariable("SQUAD_POOL_SIZE"), out var ps) && ps > 0 ? ps : 3;
+        builder.Services.AddSingleton(sp => new SquadAgentPool(
+            sp.GetRequiredService<WorkflowConfig>(),
+            sp.GetRequiredService<ILogger<SquadAgentPool>>(),
+            poolSize));
+        builder.Services.AddHostedService<SquadAgentPoolWarmer>();
+
         var useAzure = Environment.GetEnvironmentVariable("USE_AZURE_OPENAI") == "true";
 
         if (useAzure)
@@ -141,7 +152,7 @@ public static class SquadifyWebProgram
                 Guid.NewGuid().ToString("n"), title, severity, int.Parse(demo), DateTimeOffset.UtcNow);
 
             return trigger.TryTrigger(incident)
-                ? Results.Accepted("/status", trigger.State.GetSnapshot())
+                ? Results.Accepted("/status", new { accepted = true, runId = incident.Id, snapshot = trigger.State.GetSnapshot() })
                 : Results.Conflict(trigger.State.GetSnapshot());
         });
 
@@ -160,7 +171,7 @@ public static class SquadifyWebProgram
                 "Sev2", id, DateTimeOffset.UtcNow);
 
             return trigger.TryTrigger(incident)
-                ? Results.Accepted("/status", trigger.State.GetSnapshot())
+                ? Results.Accepted("/status", new { accepted = true, runId = incident.Id, snapshot = trigger.State.GetSnapshot() })
                 : Results.Conflict(trigger.State.GetSnapshot());
         });
 
@@ -212,7 +223,10 @@ public sealed class SquadifyTelemetry
 
     public Activity? StartWorkflowActivity(SimulatedIncident incident)
     {
-        var activity = _activitySource.StartActivity("SquadifyWorkflow", ActivityKind.Internal);
+        // parentContext: default → force a NEW ROOT trace per run. Without this, runs
+        // launched from a shared ambient Activity.Current (or overlapping concurrent runs)
+        // would all be stitched into one giant trace. Rooting each run isolates its trace tree.
+        var activity = _activitySource.StartActivity("SquadifyWorkflow", ActivityKind.Internal, parentContext: default);
         activity?.SetTag("incident.id", incident.Id);
         activity?.SetTag("incident.severity", incident.Severity);
         activity?.SetTag("demo.number", incident.DemoNumber);
@@ -229,89 +243,107 @@ public sealed class SquadifyTelemetry
 
 public sealed class WorkflowRunnerState
 {
-    private readonly object _gate = new();
+    // Multi-run: each run is tracked independently by its incident id so multiple
+    // workflows can be Queued/Running at the same time (no single-slot gate).
+    private readonly ConcurrentDictionary<string, RunInfo> _runs = new();
 
-    public WorkflowRunnerState()
+    public sealed class RunInfo
     {
-        Status = "WaitingForIncident";
-        LastMessage = "POST /incidents/simulate to trigger the workflow. Or POST /demo/1, /demo/2, /demo/3.";
+        public required SimulatedIncident Incident { get; init; }
+        public string Status { get; set; } = "Queued";
+        public DateTimeOffset QueuedAt { get; init; } = DateTimeOffset.UtcNow;
+        public DateTimeOffset? StartedAt { get; set; }
+        public DateTimeOffset? CompletedAt { get; set; }
+        public int? ExitCode { get; set; }
+        public string? Message { get; set; }
+        public string? Result { get; set; }
     }
 
-    public string Status { get; private set; }
-    public int? ExitCode { get; private set; }
-    public string LastMessage { get; private set; }
-    public DateTimeOffset? StartedAt { get; private set; }
-    public DateTimeOffset? CompletedAt { get; private set; }
-    public SimulatedIncident? CurrentIncident { get; private set; }
-    public string? LastRunResult { get; private set; }
-
-    public bool TryMarkQueued(SimulatedIncident incident)
+    public void MarkQueued(SimulatedIncident incident)
     {
-        lock (_gate)
+        _runs[incident.Id] = new RunInfo
         {
-            if (Status is "Queued" or "Running") return false;
-            Status = "Queued";
-            StartedAt = null;
-            CompletedAt = null;
-            ExitCode = null;
-            CurrentIncident = incident;
-            LastMessage = $"Incident {incident.Id} queued — Demo {incident.DemoNumber} will start shortly.";
-            return true;
-        }
+            Incident = incident,
+            Status = "Queued",
+            Message = $"Incident {incident.Id} queued — Demo {incident.DemoNumber} will start shortly."
+        };
     }
 
     public void MarkRunning(SimulatedIncident incident)
     {
-        lock (_gate)
+        if (_runs.TryGetValue(incident.Id, out var run))
         {
-            Status = "Running";
-            StartedAt = DateTimeOffset.UtcNow;
-            LastMessage = $"Running Demo {incident.DemoNumber}: {incident.Title}";
+            run.Status = "Running";
+            run.StartedAt = DateTimeOffset.UtcNow;
+            run.Message = $"Running Demo {incident.DemoNumber}: {incident.Title}";
         }
     }
 
-    public void MarkCompleted(string? result = null)
+    public void MarkCompleted(SimulatedIncident incident, string? result = null)
     {
-        lock (_gate)
+        if (_runs.TryGetValue(incident.Id, out var run))
         {
-            Status = "Completed";
-            ExitCode = 0;
-            CompletedAt = DateTimeOffset.UtcNow;
-            LastRunResult = result;
-            LastMessage = "Workflow completed. POST /incidents/simulate to trigger again. GET /trace for results.";
+            run.Status = "Completed";
+            run.ExitCode = 0;
+            run.CompletedAt = DateTimeOffset.UtcNow;
+            run.Result = result;
+            run.Message = "Workflow completed.";
         }
     }
 
-    public void MarkFailed(Exception ex)
+    public void MarkFailed(SimulatedIncident incident, Exception ex)
     {
-        lock (_gate)
+        if (_runs.TryGetValue(incident.Id, out var run))
         {
-            Status = "Failed";
-            ExitCode = 2;
-            CompletedAt = DateTimeOffset.UtcNow;
-            LastMessage = ex.Message;
+            run.Status = "Failed";
+            run.ExitCode = 2;
+            run.CompletedAt = DateTimeOffset.UtcNow;
+            run.Message = ex.Message;
         }
     }
 
     public object GetSnapshot()
     {
-        lock (_gate)
+        var all = _runs.Values.ToList();
+        var active = all.Where(r => r.Status is "Queued" or "Running")
+            .OrderBy(r => r.QueuedAt)
+            .Select(ToDto).ToList();
+        var recent = all.Where(r => r.Status is "Completed" or "Failed")
+            .OrderByDescending(r => r.CompletedAt)
+            .Take(10)
+            .Select(ToDto).ToList();
+
+        return new
         {
-            return new
-            {
-                service = "squadify-workflow",
-                status = Status,
-                exitCode = ExitCode,
-                startedAt = StartedAt,
-                completedAt = CompletedAt,
-                message = LastMessage,
-                incident = CurrentIncident,
-                lastRunResult = LastRunResult,
-                triggerEndpoint = "POST /incidents/simulate?severity=Sev2&title=Database%20latency&demo=3",
-                traceEndpoint = "GET /trace"
-            };
-        }
+            service = "squadify-workflow",
+            anyRunning = active.Count > 0,
+            activeCount = active.Count,
+            activeRuns = active,
+            recentRuns = recent,
+            message = active.Count > 0
+                ? $"{active.Count} workflow run(s) in progress (runs execute concurrently)."
+                : "Idle. POST /demo/1, /demo/2, or /demo/3 to trigger runs — they execute concurrently.",
+            triggerEndpoint = "POST /demo/3",
+            traceEndpoint = "GET /trace"
+        };
     }
+
+    private static object ToDto(RunInfo r) => new
+    {
+        runId = r.Incident.Id,
+        demo = r.Incident.DemoNumber,
+        title = r.Incident.Title,
+        severity = r.Incident.Severity,
+        status = r.Status,
+        queuedAt = r.QueuedAt,
+        startedAt = r.StartedAt,
+        completedAt = r.CompletedAt,
+        exitCode = r.ExitCode,
+        message = r.Message,
+        durationMs = r.StartedAt.HasValue && r.CompletedAt.HasValue
+            ? (r.CompletedAt.Value - r.StartedAt.Value).TotalMilliseconds
+            : (double?)null,
+    };
 }
 
 public sealed class WorkflowTrigger
@@ -335,7 +367,10 @@ public sealed class WorkflowTrigger
 
     public bool TryTrigger(SimulatedIncident incident)
     {
-        if (!State.TryMarkQueued(incident)) return false;
+        // No single-slot gate — every trigger is accepted and runs concurrently.
+        // The run is registered in state and written to the channel; the runner
+        // launches each dequeued incident on its own Task.
+        State.MarkQueued(incident);
 
         if (_channel.Writer.TryWrite(incident))
         {
@@ -474,6 +509,7 @@ public sealed class WorkflowTriggeredRunner : BackgroundService
     private readonly WorkflowTraceStore _traceStore;
     private readonly WorkflowConfig _config;
     private readonly IChatClient _chatClient;
+    private readonly SquadAgentPool _pool;
     private readonly ILogger<WorkflowTriggeredRunner> _logger;
 
     public WorkflowTriggeredRunner(
@@ -483,6 +519,7 @@ public sealed class WorkflowTriggeredRunner : BackgroundService
         WorkflowTraceStore traceStore,
         WorkflowConfig config,
         IChatClient chatClient,
+        SquadAgentPool pool,
         ILogger<WorkflowTriggeredRunner> logger)
     {
         _state = state;
@@ -491,49 +528,67 @@ public sealed class WorkflowTriggeredRunner : BackgroundService
         _traceStore = traceStore;
         _config = config;
         _chatClient = chatClient;
+        _pool = pool;
         _logger = logger;
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        _logger.LogInformation("WorkflowTriggeredRunner started. Team root: {TeamRoot}", _config.TeamRoot);
+        _logger.LogInformation(
+            "WorkflowTriggeredRunner started. Team root: {TeamRoot}. Squad pool size: {Size}",
+            _config.TeamRoot, _pool.Size);
 
+        // Launch each dequeued incident on its OWN task so workflow runs execute
+        // CONCURRENTLY instead of one-at-a-time. Squad-node concurrency is naturally
+        // capped by the warm pool (RentAsync blocks when all agents are busy).
+        var running = new List<Task>();
         await foreach (var incident in _trigger.Incidents.ReadAllAsync(stoppingToken))
         {
-            _state.MarkRunning(incident);
-            var runTrace = _traceStore.StartRun(incident);
-            using var activity = _telemetry.StartWorkflowActivity(incident);
-            var started = Stopwatch.GetTimestamp();
+            var task = Task.Run(() => RunOneAsync(incident, stoppingToken), stoppingToken);
+            running.Add(task);
+            running.RemoveAll(t => t.IsCompleted);
+        }
 
+        await Task.WhenAll(running);
+    }
+
+    private async Task RunOneAsync(SimulatedIncident incident, CancellationToken stoppingToken)
+    {
+        _state.MarkRunning(incident);
+        var runTrace = _traceStore.StartRun(incident);
+        // Root activity started INSIDE this per-run task with parentContext: default,
+        // so each concurrent run produces its own isolated trace tree.
+        using var activity = _telemetry.StartWorkflowActivity(incident);
+        var started = Stopwatch.GetTimestamp();
+
+        _logger.LogInformation(
+            "Starting Demo {Demo} for incident {Id}: {Title}",
+            incident.DemoNumber, incident.Id, incident.Title);
+
+        try
+        {
+            await RunDemoAsync(incident, runTrace, stoppingToken);
+            runTrace.Complete(runTrace.FinalResult);
+            var duration = Stopwatch.GetElapsedTime(started);
+            _state.MarkCompleted(incident, runTrace.FinalResult);
+            _telemetry.RecordWorkflowCompleted(incident, duration);
+            activity?.SetStatus(ActivityStatusCode.Ok);
             _logger.LogInformation(
-                "Starting Demo {Demo} for incident {Id}: {Title}",
-                incident.DemoNumber, incident.Id, incident.Title);
-
-            try
-            {
-                await RunDemoAsync(incident, runTrace, stoppingToken);
-                runTrace.Complete(runTrace.FinalResult);
-                var duration = Stopwatch.GetElapsedTime(started);
-                _state.MarkCompleted(runTrace.FinalResult);
-                _telemetry.RecordWorkflowCompleted(incident, duration);
-                activity?.SetStatus(ActivityStatusCode.Ok);
-                _logger.LogInformation(
-                    "Demo {Demo} completed in {Duration:F0}ms",
-                    incident.DemoNumber, duration.TotalMilliseconds);
-            }
-            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
-            {
-                runTrace.Complete("Cancelled");
-                _state.MarkCompleted();
-                activity?.SetStatus(ActivityStatusCode.Ok);
-            }
-            catch (Exception ex)
-            {
-                runTrace.Fail(ex.Message);
-                _state.MarkFailed(ex);
-                activity?.SetStatus(ActivityStatusCode.Error, ex.Message);
-                _logger.LogError(ex, "Demo {Demo} failed for incident {Id}", incident.DemoNumber, incident.Id);
-            }
+                "Demo {Demo} completed in {Duration:F0}ms",
+                incident.DemoNumber, duration.TotalMilliseconds);
+        }
+        catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+        {
+            runTrace.Complete("Cancelled");
+            _state.MarkCompleted(incident);
+            activity?.SetStatus(ActivityStatusCode.Ok);
+        }
+        catch (Exception ex)
+        {
+            runTrace.Fail(ex.Message);
+            _state.MarkFailed(incident, ex);
+            activity?.SetStatus(ActivityStatusCode.Error, ex.Message);
+            _logger.LogError(ex, "Demo {Demo} failed for incident {Id}", incident.DemoNumber, incident.Id);
         }
     }
 
@@ -613,7 +668,21 @@ public sealed class WorkflowTriggeredRunner : BackgroundService
         trace.AddStep("WorkflowBuilder", "Infrastructure", "Building MAF DAG: 7 executors, edges + fan-out + fan-in barrier, WithOpenTelemetry");
 
         var alertInput = $"ALERT [{incident.Severity}]: {incident.Title} (id={incident.Id})";
-        var result = await SquadifiedWorkflow.RunWorkflowAsync(alertInput, _config.TeamRoot, _logger, _chatClient);
+
+        // Rent a pre-warmed Squad agent from the pool (cold-start optimization).
+        // RentAsync blocks when all pooled agents are busy → this is the concurrency cap
+        // for the Squad node. The agent is returned in finally for the next run to reuse.
+        var pooled = await _pool.RentAsync();
+        string result;
+        try
+        {
+            result = await SquadifiedWorkflow.RunWorkflowAsync(
+                alertInput, _config.TeamRoot, _logger, _chatClient, pooled.Agent);
+        }
+        finally
+        {
+            _pool.Return(pooled);
+        }
 
         trace.AddStep("AlertValidator", "MAF ChatClientAgent (Azure OpenAI)", "LLM classified alert severity");
         trace.AddStep("SquadAnalysis", "Squad Agent node (Copilot CLI)", "Squad team analyzed via sub-agents");

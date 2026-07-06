@@ -37,22 +37,70 @@ public static class SquadifiedWorkflow
     private static readonly ActivitySource s_workflowSource = new("SquadifyDemo.Workflow");
 
     /// <summary>
-    /// Builds and runs the squadified MAF workflow. Signature is preserved for the web host call site.
+    /// Builds and runs the squadified MAF workflow.
     /// </summary>
+    /// <param name="pooledSquadAgent">
+    /// An optional pre-warmed <see cref="SquadAgent"/> rented from the <c>SquadAgentPool</c>.
+    /// When supplied, the Squad node reuses it (no per-run host build, no dispose) — the
+    /// cold-start optimization. When null, the Squad node builds and disposes its own agent
+    /// (the original cold path, used as a fallback).
+    /// </param>
     public static async Task<string> RunWorkflowAsync(
-        string alertInput, string squadFolder, ILogger logger, IChatClient? chatClient = null)
+        string alertInput, string squadFolder, ILogger logger,
+        IChatClient? chatClient = null, SquadAgent? pooledSquadAgent = null)
     {
         logger.LogInformation("Building squadified MAF workflow (WorkflowBuilder DAG)...");
         logger.LogInformation("  Graph: [validator] → [squad-analysis] → [enricher] → fan-out{{slack,pagerduty,statuspage}} → barrier → [aggregator]");
 
-        // ── Build the executor nodes ──
-        var validator = new ValidatorExecutor("validator", BuildValidatorAgent(chatClient, logger), chatClient, logger);
-        var squad = new SquadExecutor("squad-analysis", squadFolder, logger);
-        var enricher = new EnricherExecutor("enricher", logger);
-        var slack = new NotifierExecutor("notify-slack", "Slack #incidents", logger);
-        var pagerDuty = new NotifierExecutor("notify-pagerduty", "PagerDuty", logger);
-        var statusPage = new NotifierExecutor("notify-statuspage", "StatusPage", logger);
-        var aggregator = new NotificationAggregator("aggregator", expected: 3);
+        // ── Build the executor nodes as FACTORY-BOUND bindings ──
+        // MAF's Concurrent execution environment (InProcessExecution.Concurrent) refuses to run
+        // a graph whose executors are shared, pre-instantiated instances — it demands each
+        // executor be either "cross-run share-capable" or "factory-created" so every concurrent
+        // run gets its own fresh, isolated executor. We register each node via a factory delegate
+        // (Func<id, sessionId, ValueTask<TExecutor>>) using ExecutorBinding's BindExecutor helper.
+        // The per-run inputs (chatClient, squadFolder, pooledSquadAgent, logger) are captured in
+        // the closures; because RunWorkflowAsync builds a fresh workflow per run, each run's
+        // factories close over that run's own rented pooled agent.
+        ExecutorBinding validator =
+            new Func<string, string, ValueTask<ValidatorExecutor>>(
+                (id, _) => new ValueTask<ValidatorExecutor>(
+                    new ValidatorExecutor(id, BuildValidatorAgent(chatClient, logger), chatClient, logger)))
+            .BindExecutor("validator");
+
+        ExecutorBinding squad =
+            new Func<string, string, ValueTask<SquadExecutor>>(
+                (id, _) => new ValueTask<SquadExecutor>(
+                    new SquadExecutor(id, squadFolder, logger, pooledSquadAgent)))
+            .BindExecutor("squad-analysis");
+
+        ExecutorBinding enricher =
+            new Func<string, string, ValueTask<EnricherExecutor>>(
+                (id, _) => new ValueTask<EnricherExecutor>(new EnricherExecutor(id, logger)))
+            .BindExecutor("enricher");
+
+        ExecutorBinding slack =
+            new Func<string, string, ValueTask<NotifierExecutor>>(
+                (id, _) => new ValueTask<NotifierExecutor>(
+                    new NotifierExecutor(id, "Slack #incidents", logger)))
+            .BindExecutor("notify-slack");
+
+        ExecutorBinding pagerDuty =
+            new Func<string, string, ValueTask<NotifierExecutor>>(
+                (id, _) => new ValueTask<NotifierExecutor>(
+                    new NotifierExecutor(id, "PagerDuty", logger)))
+            .BindExecutor("notify-pagerduty");
+
+        ExecutorBinding statusPage =
+            new Func<string, string, ValueTask<NotifierExecutor>>(
+                (id, _) => new ValueTask<NotifierExecutor>(
+                    new NotifierExecutor(id, "StatusPage", logger)))
+            .BindExecutor("notify-statuspage");
+
+        ExecutorBinding aggregator =
+            new Func<string, string, ValueTask<NotificationAggregator>>(
+                (id, _) => new ValueTask<NotificationAggregator>(
+                    new NotificationAggregator(id, expected: 3)))
+            .BindExecutor("aggregator");
 
         // ── Wire the DAG with real WorkflowBuilder edges ──
         var workflow = new WorkflowBuilder(validator)
@@ -71,7 +119,11 @@ public static class SquadifiedWorkflow
         string enriched = "";
         string notifications = "";
 
-        await using var run = await InProcessExecution.RunStreamingAsync(workflow, alertInput);
+        // Use the purpose-built Concurrent execution environment so multiple workflow
+        // runs can execute in parallel. Each run builds a FRESH workflow instance above,
+        // and the Concurrent environment (enableConcurrentRuns: true) does not take an
+        // exclusive ownership lock on the workflow — so concurrent runs don't serialize.
+        await using var run = await InProcessExecution.Concurrent.RunStreamingAsync(workflow, alertInput);
         await foreach (var evt in run.WatchStreamAsync())
         {
             switch (evt)
@@ -194,11 +246,13 @@ public static class SquadifiedWorkflow
     {
         private readonly string _squadFolder;
         private readonly ILogger _logger;
+        private readonly SquadAgent? _pooledAgent;
 
-        public SquadExecutor(string id, string squadFolder, ILogger logger) : base(id)
+        public SquadExecutor(string id, string squadFolder, ILogger logger, SquadAgent? pooledAgent = null) : base(id)
         {
             _squadFolder = squadFolder;
             _logger = logger;
+            _pooledAgent = pooledAgent;
         }
 
         public override async ValueTask<string> HandleAsync(
@@ -212,6 +266,15 @@ public static class SquadifiedWorkflow
             // executor-invocation span the ambient Activity.Current during HandleAsync, so we start our own.
             using var squadActivity = s_workflowSource.StartActivity("squad-analysis");
 
+            // WARM PATH: reuse a pre-built agent rented from the pool. No host build, no dispose —
+            // the pool owns the host lifetime. This is the cold-start optimization.
+            if (_pooledAgent is not null)
+            {
+                _logger.LogInformation("[squad-analysis] ♻️  Reusing warm pooled Squad agent: {Name}", _pooledAgent.Name);
+                return await RunWithAgentAsync(_pooledAgent, validatedAlert);
+            }
+
+            // COLD PATH (fallback): build a dedicated host + agent for this run and dispose it after.
             var builder = Host.CreateApplicationBuilder();
             builder.Logging.SetMinimumLevel(LogLevel.Warning);
             builder.Services.AddSquadAgent(o =>
@@ -249,7 +312,23 @@ public static class SquadifiedWorkflow
             var squad = host.Services.GetRequiredService<SquadAgent>();
             _logger.LogInformation("[squad-analysis] Squad agent ready: {Name}", squad.Name);
 
-            string analysisResult;
+            try
+            {
+                return await RunWithAgentAsync(squad, validatedAlert);
+            }
+            finally
+            {
+                if (squad is IAsyncDisposable asyncDisposable)
+                    await asyncDisposable.DisposeAsync();
+            }
+        }
+
+        /// <summary>
+        /// Shared run logic: open a fresh session on the given Squad agent, stream the analysis,
+        /// and return the accumulated text. Used by both the warm (pooled) and cold (build-own) paths.
+        /// </summary>
+        private async Task<string> RunWithAgentAsync(SquadAgent squad, string validatedAlert)
+        {
             try
             {
                 var session = await squad.CreateSessionAsync();
@@ -260,24 +339,18 @@ public static class SquadifiedWorkflow
                         responseText.Append(update.Text);
                 }
 
-                analysisResult = responseText.ToString();
+                var analysisResult = responseText.ToString();
                 if (string.IsNullOrWhiteSpace(analysisResult))
                     analysisResult = "(Squad agent returned empty response)";
 
                 _logger.LogInformation("[squad-analysis] → Analysis complete ({Length} chars)", analysisResult.Length);
+                return analysisResult;
             }
             catch (Exception ex)
             {
                 _logger.LogWarning(ex, "[squad-analysis] Squad agent error");
-                analysisResult = $"Analysis unavailable — Squad agent error: {ex.Message}";
+                return $"Analysis unavailable — Squad agent error: {ex.Message}";
             }
-            finally
-            {
-                if (squad is IAsyncDisposable asyncDisposable)
-                    await asyncDisposable.DisposeAsync();
-            }
-
-            return analysisResult;
         }
     }
 

@@ -121,3 +121,63 @@ tool calls and messages.
    maintains for its own UI. **Not** OpenTelemetry.
 2. **The real Aspire dashboard traces** at `.../traces/detail/<id>` — fed by the OpenTelemetry
    `ActivitySource` spans described above. This is the one you inspect for distributed tracing.
+
+## Concurrent runs, per-run traces, and warm-up
+
+The `feature/concurrent-workflows` branch adds three improvements so multiple incidents can be
+triggered at once, each with its own clean trace, without the long cold-start penalty on every run.
+
+### 1. One trace per run (no more merged traces)
+
+Each triggered incident starts its own root `Activity`, so the Aspire dashboard shows a **separate
+trace per run** instead of collapsing every workflow into one giant trace. The demo UI keeps a
+per-run entry too — `/trace` returns an array of runs and `/trace/{runId}` returns a single run.
+Every run carries a distinct `runId`, and its executor spans (`validator` → `squad-analysis` →
+`enricher` → `notify-*` → `aggregator`) hang off that run's root.
+
+### 2. Warm agent pool — cold-start reuse
+
+Building a `SquadAgent` (which boots the Copilot CLI subprocess and loads the team) is expensive.
+Previously that cost was paid on **every** run. Now a `SquadAgentPool` pre-builds a bounded set of
+warm agents at startup via a `BackgroundService` (`SquadAgentPoolWarmer`), and each Demo-3 run
+**rents** a ready agent instead of constructing one:
+
+- Pool size is configurable with `SQUAD_POOL_SIZE` (default **3**).
+- `RentAsync` hands out a warm agent; `Return` puts it back for the next run.
+- The pool doubles as a concurrency cap — no more agents run at once than the pool holds.
+
+**Measured impact:** first (cold) run ≈ **280,724 ms**; a warmed run ≈ **141,928 ms** — about a
+**49% reduction** in end-to-end time once the pool is primed.
+
+### 3. True concurrent execution
+
+The web app no longer serializes runs behind a single gate. `WorkflowRunnerState` is a
+`ConcurrentDictionary<string, RunInfo>`, each incident executes on its own `Task.Run`, and both
+trigger endpoints return **202 Accepted** immediately with the new `runId`.
+
+To make the MAF workflow itself safe to run concurrently, the workflow uses
+`InProcessExecution.Concurrent.RunStreamingAsync`. That path rejects pre-instantiated shared
+executors at DAG-build time:
+
+> *Workflow must only consist of cross-run share-capable or factory-created executors…*
+
+The fix is to register every executor through a **factory** so each run gets a fresh instance.
+`BindExecutor` takes a `Func<string, string, ValueTask<TExecutor>>` (params are `(id, sessionId)`),
+invoked per run:
+
+```csharp
+ExecutorBinding validator =
+    new Func<string, string, ValueTask<ValidatorExecutor>>(
+        (id, _) => new ValueTask<ValidatorExecutor>(
+            new ValidatorExecutor(id, BuildValidatorAgent(chatClient, logger), chatClient, logger)))
+    .BindExecutor("validator");
+```
+
+Because `RunWorkflowAsync` builds a fresh workflow per run, each run's factory closures capture that
+run's own rented pooled agent — so concurrent runs never share executor state.
+
+**Verified live:** three Demo-3 runs fired within ~27 s of each other all ran simultaneously
+(`activeCount: 3`) and completed with overlapping windows — e.g. runs starting at 20:29:40, 20:30:06,
+and 20:30:07 were all in-flight together for ~3 minutes, then finished at 20:33:07, 20:33:16, and
+20:35:23. Serialized execution could not produce those overlapping timestamps. Each run produced its
+own distinct 6-step trace.

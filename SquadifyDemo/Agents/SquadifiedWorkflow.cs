@@ -230,7 +230,7 @@ public static class SquadifiedWorkflow
             squadActivity?.SetTag(GenAi.OperationName, "chat");
             squadActivity?.SetTag(GenAi.ProviderName, "squad");
             squadActivity?.SetTag(GenAi.RequestModel, GenAi.SquadModel);
-            squadActivity?.SetTag(GenAi.SystemInstructions, coordinatorInstructions);
+            squadActivity?.SetTag(GenAi.SystemInstructions, GenAi.SystemInstructionsJson(coordinatorInstructions));
             // input.messages = what we sent the Squad coordinator (system instructions + the validated alert).
             squadActivity?.SetTag(GenAi.InputMessages, new JsonArray(
                 GenAi.TextMessage("system", coordinatorInstructions),
@@ -467,6 +467,15 @@ public static class SquadifiedWorkflow
 
             /// <summary>Sub-agents run via the Copilot CLI, not a hosted model — label honestly.</summary>
             public const string SquadModel = "copilot-cli";
+
+            /// <summary>
+            /// gen_ai.system_instructions is a JSON array of message parts (NOT a raw string and NOT a
+            /// role-wrapped message): [{"type":"text","content":"..."}]. The Aspire dashboard parses this
+            /// attribute as JSON, so a plain string like "You are..." throws a JsonReaderException and the
+            /// entire AI-details view fails to render.
+            /// </summary>
+            public static string SystemInstructionsJson(string content)
+                => new JsonArray(new JsonObject { ["type"] = "text", ["content"] = content }).ToJsonString();
 
             /// <summary>A chat message with a single text part: {role, name?, parts:[{type:text, content}], finish_reason?}.</summary>
             public static JsonObject TextMessage(string role, string content, string? name = null, string? finishReason = null)

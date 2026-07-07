@@ -145,6 +145,32 @@ run will download the model.
 
 ---
 
+## Concurrent runs, warm-up & per-run traces
+
+You can fire several incidents at once and watch them run **truly in parallel**, each with its own
+clean trace — without paying the Squad cold-start cost on every run.
+
+- **True concurrent execution.** Trigger the incident command (or `POST /incidents/simulate`) multiple
+  times back-to-back. Each run executes on its own `Task.Run`, the endpoint returns **202 Accepted**
+  immediately with a fresh `runId`, and `/status` reports the live `activeCount`. Under the hood the
+  workflow uses MAF's `InProcessExecution.Concurrent.RunStreamingAsync`.
+- **A warm agent pool kills the per-run cold start.** Building a `SquadAgent` (which boots the Copilot
+  CLI subprocess and loads the team) is expensive. A `SquadAgentPool` pre-builds a bounded set of warm
+  agents at startup via a `BackgroundService`, and each run **rents** a ready agent instead of building
+  one. Pool size is configurable with `SQUAD_POOL_SIZE` (default **3**), and the pool doubles as the
+  concurrency cap. Measured impact: first cold run ≈ 280 s vs a warmed run ≈ 142 s (~49% faster).
+- **One trace per run.** Each run starts its own root `Activity`, so the Aspire dashboard shows a
+  **separate trace per incident** instead of one merged giant trace. `/trace` returns the array of
+  runs; `/trace/{runId}` returns a single run.
+- **Factory-bound executors.** MAF's concurrent runtime rejects shared, pre-instantiated executors, so
+  every node is registered through a factory (a small `Bind<T>` helper) — each concurrent run gets a
+  fresh, isolated executor closing over its own rented pooled agent.
+
+See [`docs/telemetry.md`](docs/telemetry.md) for the trace shapes, the `Bind<T>` pattern, and the
+live concurrency verification.
+
+---
+
 ## Project layout
 
 | Path | What it is |

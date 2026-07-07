@@ -248,9 +248,9 @@
             <!-- Steps/Results -->
             <div class="results-container" id="resultsContainer">
                 <div class="empty-state" id="emptyState">
-                    <p>🎯 Trigger an incident above to see the workflow steps appear here in real-time</p>
+                    <p>🎯 Trigger one or more incidents above — each runs as an independent, concurrent workflow</p>
                     <p style="margin-top:0.5rem; font-size:0.8rem;">
-                        Demo 3 will show Squad dispatching LogAnalyzer and Remediator subagents
+                        Demo 3 shows Squad dispatching LogAnalyzer and Remediator subagents. Click Run several times to see parallel runs.
                     </p>
                 </div>
             </div>
@@ -265,8 +265,13 @@
     </div>
 
     <script>
+        // Concurrent-run aware dashboard.
+        // Each "Run Workflow" click triggers an INDEPENDENT workflow run that executes
+        // in parallel with any others. We poll /status to know when work is in flight and
+        // /trace as the single source of truth for per-run steps + results (keyed by runId).
         let pollInterval = null;
-        let currentRunId = null;
+        let idlePolls = 0;              // consecutive polls with nothing running
+        const triggeredRunIds = new Set(); // runs launched from THIS browser session
 
         function triggerIncident() {
             const title = document.getElementById('incidentTitle').value;
@@ -274,97 +279,123 @@
             const demo = document.getElementById('demoNumber').value;
 
             const btn = document.getElementById('triggerBtn');
-            btn.disabled = true;
-            btn.textContent = '⏳ Running...';
+            // Do NOT globally disable — runs are concurrent, user can launch several.
+            const orig = btn.textContent;
+            btn.textContent = '⏳ Queued…';
+            setTimeout(() => { btn.textContent = orig; }, 900);
 
-            clearResults();
-            setStatus('running', `Running Demo ${demo}...`);
+            document.getElementById('emptyState')?.remove();
 
             const params = new URLSearchParams({ title, severity, demo });
             fetch(`/incidents/simulate?${params}`, { method: 'POST' })
                 .then(r => r.json())
                 .then(data => {
-                    currentRunId = data.incident?.id;
+                    if (data.runId) triggeredRunIds.add(data.runId);
                     startPolling();
+                    refresh(); // immediate paint
                 })
-                .catch(err => {
-                    setStatus('failed', `Error: ${err.message}`);
-                    btn.disabled = false;
-                    btn.textContent = '🚀 Run Workflow';
-                });
+                .catch(err => setStatus('failed', `Error: ${err.message}`));
         }
 
         function startPolling() {
-            if (pollInterval) clearInterval(pollInterval);
-            pollInterval = setInterval(async () => {
-                try {
-                    const res = await fetch('/status');
-                    const data = await res.json();
-
-                    if (data.status === 'Running') {
-                        setStatus('running', data.message);
-                    } else if (data.status === 'Completed') {
-                        setStatus('completed', '✅ Workflow completed!');
-                        stopPolling();
-                        loadTraceResults();
-                    } else if (data.status === 'Failed') {
-                        setStatus('failed', `❌ ${data.message}`);
-                        stopPolling();
-                    }
-                } catch (e) { /* ignore transient fetch errors */ }
-            }, 1500);
+            idlePolls = 0;
+            if (pollInterval) return;
+            pollInterval = setInterval(refresh, 1500);
         }
 
         function stopPolling() {
             if (pollInterval) { clearInterval(pollInterval); pollInterval = null; }
-            const btn = document.getElementById('triggerBtn');
-            btn.disabled = false;
-            btn.textContent = '🚀 Run Workflow';
         }
 
-        async function loadTraceResults() {
+        async function refresh() {
             try {
-                const res = await fetch('/trace');
-                const runs = await res.json();
-                if (runs.length === 0) return;
+                const [statusRes, traceRes] = await Promise.all([
+                    fetch('/status'),
+                    fetch('/trace')
+                ]);
+                const status = await statusRes.json();
+                const runs = await traceRes.json();
 
-                const latest = runs[runs.length - 1];
-                renderResults(latest);
-            } catch (e) { console.error(e); }
+                renderAllRuns(runs, status);
+
+                const active = status.activeCount || 0;
+                if (active > 0) {
+                    idlePolls = 0;
+                    setStatus('running', `${active} workflow run(s) executing concurrently…`);
+                } else {
+                    setStatus('completed', runs.length ? '✅ All runs complete' : 'Ready — waiting for incident');
+                    // Poll a couple more times after idle to catch final trace writes, then stop.
+                    if (++idlePolls >= 2) stopPolling();
+                }
+            } catch (e) { /* ignore transient fetch errors */ }
         }
 
-        function renderResults(run) {
-            const container = document.getElementById('resultsContainer');
-            document.getElementById('emptyState')?.remove();
-
-            let html = '';
-
-            if (run.steps && run.steps.length > 0) {
-                for (const step of run.steps) {
-                    const typeClass = step.type === 'squad-analysis' ? 'active' : '';
-                    html += `
-                        <div class="step-card ${step.step === 'FinalResult' ? 'final-result' : ''}">
-                            <div class="step-header">
-                                <span class="step-name">${getStepIcon(step.type)} ${step.step}</span>
-                                <span class="step-type ${typeClass}">${step.type}</span>
-                            </div>
-                            <div class="step-output">${escapeHtml(step.output)}</div>
-                        </div>`;
-                }
+        // Merge /status active runs (may be Queued with no trace yet) with /trace runs (have steps).
+        function renderAllRuns(traceRuns, status) {
+            const byId = new Map();
+            // Seed with active runs from /status so Queued runs appear before a trace exists.
+            for (const r of (status.activeRuns || [])) {
+                byId.set(r.runId, { runId: r.runId, demo: r.demo, title: r.title, severity: r.severity,
+                                    status: r.status, durationMs: r.durationMs, steps: [], finalResult: null });
             }
+            // Overlay trace runs (authoritative for steps, finalResult, final status).
+            for (const r of traceRuns) byId.set(r.runId, r);
 
-            if (run.finalResult) {
-                html += `
-                    <div class="step-card final-result">
+            const all = Array.from(byId.values());
+            if (all.length === 0) return;
+
+            // Newest first by start time.
+            all.sort((a, b) => new Date(b.startedAt || 0) - new Date(a.startedAt || 0));
+
+            const container = document.getElementById('resultsContainer');
+            container.innerHTML = all.map(renderRunCard).join('');
+        }
+
+        function renderRunCard(run) {
+            const mine = triggeredRunIds.has(run.runId);
+            const st = (run.status || 'Running').toLowerCase();
+            const statusColor = st === 'completed' ? '#22c55e' : st === 'failed' ? '#ef4444' : '#f59e0b';
+            const dur = run.durationMs ? Math.round(run.durationMs / 1000) + 's'
+                      : (st === 'completed' || st === 'failed') ? '—' : '⏳ running';
+            const shortId = (run.runId || '').slice(0, 8);
+
+            let steps = '';
+            for (const step of (run.steps || [])) {
+                const typeClass = step.type === 'squad-analysis' ? 'active' : '';
+                steps += `
+                    <div class="step-card ${step.step === 'FinalResult' ? 'final-result' : ''}">
                         <div class="step-header">
-                            <span class="step-name">🏁 Final Result</span>
-                            <span class="step-type">duration: ${run.durationMs ? Math.round(run.durationMs/1000) + 's' : '—'}</span>
+                            <span class="step-name">${getStepIcon(step.type)} ${escapeHtml(step.step)}</span>
+                            <span class="step-type ${typeClass}">${escapeHtml(step.type)}</span>
                         </div>
+                        <div class="step-output">${escapeHtml(step.output)}</div>
+                    </div>`;
+            }
+            if (run.finalResult && st === 'completed') {
+                steps += `
+                    <div class="step-card final-result">
+                        <div class="step-header"><span class="step-name">🏁 Final Result</span></div>
                         <div class="step-output">${escapeHtml(run.finalResult)}</div>
                     </div>`;
             }
+            if (!steps) steps = `<div class="step-output" style="opacity:0.6; padding:0.5rem;">Initializing…</div>`;
 
-            container.innerHTML = html;
+            return `
+                <div class="run-card" style="border:1px solid rgba(255,255,255,0.12); border-left:4px solid ${statusColor};
+                            border-radius:10px; padding:0.75rem 1rem; margin-bottom:1rem; background:rgba(255,255,255,0.02);">
+                    <div class="step-header" style="margin-bottom:0.5rem;">
+                        <span class="step-name">
+                            ${mine ? '⭐ ' : ''}Demo ${run.demo} — ${escapeHtml(run.title || '')}
+                        </span>
+                        <span class="step-type" style="background:${statusColor}22; color:${statusColor};">
+                            ${run.status || 'Running'} · ${dur}
+                        </span>
+                    </div>
+                    <div style="font-size:0.72rem; opacity:0.55; margin-bottom:0.5rem;">
+                        run ${shortId} · ${escapeHtml(run.severity || '')}
+                    </div>
+                    ${steps}
+                </div>`;
         }
 
         function getStepIcon(type) {
@@ -386,23 +417,20 @@
         function clearResults() {
             document.getElementById('resultsContainer').innerHTML = `
                 <div class="empty-state" id="emptyState">
-                    <p>🎯 Trigger an incident above to see the workflow steps appear here in real-time</p>
+                    <p>🎯 Trigger one or more incidents above — each runs as an independent, concurrent workflow</p>
                     <p style="margin-top:0.5rem; font-size:0.8rem;">
-                        Demo 3 will show Squad dispatching LogAnalyzer and Remediator subagents
+                        Demo 3 shows Squad dispatching LogAnalyzer and Remediator subagents. Click Run several times to see parallel runs.
                     </p>
                 </div>`;
             setStatus('', 'Ready — waiting for incident');
         }
 
         async function viewTraces() {
-            const res = await fetch('/trace');
-            const runs = await res.json();
-            if (runs.length === 0) {
+            await refresh();
+            const container = document.getElementById('resultsContainer');
+            if (!container.querySelector('.run-card')) {
                 alert('No trace data yet. Run a workflow first!');
-                return;
             }
-            // Show latest trace
-            renderResults(runs[runs.length - 1]);
         }
 
         async function checkHealth() {
@@ -416,8 +444,8 @@
         }
 
         function escapeHtml(str) {
-            if (!str) return '';
-            return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+            if (str === null || str === undefined) return '';
+            return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
         }
 
         // Update badge highlighting based on demo selection
@@ -425,6 +453,9 @@
             const badges = document.querySelectorAll('.demo-badges .badge');
             badges.forEach((b, i) => b.classList.toggle('active', i === parseInt(e.target.value) - 1));
         });
+
+        // Show any runs that already exist on load.
+        refresh();
     </script>
 </body>
 </html>

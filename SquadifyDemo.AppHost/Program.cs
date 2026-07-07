@@ -28,7 +28,10 @@ var squad = builder.AddSquad("incident-response-squad",
     teamRoot: Path.GetFullPath(Path.Combine(builder.AppHostDirectory, "..")));
 
 // Add the SquadifyDemo workflow as a project resource.
-var workflow = builder.AddProject<Projects.SquadifyDemo>("squadify-workflow")
+// launchProfileName: null → ignore launchSettings.json (its hardcoded
+// https://localhost:62159 collides with DCP's proxy port). Aspire injects
+// HTTP_PORTS and the app binds that instead.
+var workflow = builder.AddProject<Projects.SquadifyDemo>("squadify-workflow", launchProfileName: null)
     .WithReference(squad)
     .WithEnvironment("USE_AZURE_OPENAI", useAzure ? "true" : "false")
     .WithHttpEndpoint(name: "http", env: "HTTP_PORTS")

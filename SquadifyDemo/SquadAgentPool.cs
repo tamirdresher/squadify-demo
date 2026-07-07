@@ -74,6 +74,9 @@ public sealed class SquadAgentPool : IAsyncDisposable
         _logger.LogInformation(
             "[SquadAgentPool] ✅ {Size} agents warm in {Ms:F0}ms — runs will reuse them (no per-run cold start).",
             _size, Stopwatch.GetElapsedTime(started).TotalMilliseconds);
+        ProfileLog.Write(string.Format(System.Globalization.CultureInfo.InvariantCulture,
+            "[pool] WARM-UP COMPLETE: {0} agents built in {1:F0}ms (parallel)",
+            _size, Stopwatch.GetElapsedTime(started).TotalMilliseconds));
     }
 
     /// <summary>Rents a warm agent. Blocks (backpressure) until one is idle.</summary>
@@ -85,8 +88,22 @@ public sealed class SquadAgentPool : IAsyncDisposable
 
     private PooledSquadAgent BuildOne(int index)
     {
+        // ── TIMING INSTRUMENTATION ──
+        // Splits BuildOne into its phases so we can see (in the logs) exactly where
+        // the "warm-up" cost lands. Decompiling Squad.Agents.AI 0.5.5 showed that
+        // AddSquadAgent → SquadAgent construction only does `new CopilotClient(options)`
+        // and `client.AsAIAgent(sessionConfig)` — it does NOT call StartAsync. The CLI
+        // runtime subprocess spawns LAZILY on the first CreateSessionAsync (see the
+        // session-vs-stream timing in SquadifiedWorkflow.RunWithAgentAsync). So we expect
+        // these phases to be cheap; the real cold-start lands on the first run.
+        var swTotal = Stopwatch.StartNew();
+
+        var swBuilder = Stopwatch.StartNew();
         var builder = Host.CreateApplicationBuilder();
         builder.Logging.SetMinimumLevel(LogLevel.Warning);
+        swBuilder.Stop();
+
+        var swAdd = Stopwatch.StartNew();
         builder.Services.AddSquadAgent(o =>
         {
             o.SquadFolderPath = _squadFolder;
@@ -117,10 +134,29 @@ public sealed class SquadAgentPool : IAsyncDisposable
                 }
             };
         });
+        swAdd.Stop();
 
+        var swBuild = Stopwatch.StartNew();
         var host = builder.Build();
+        swBuild.Stop();
+
+        var swResolve = Stopwatch.StartNew();
         var agent = host.Services.GetRequiredService<SquadAgent>();
-        _logger.LogInformation("[SquadAgentPool] Built agent slot {Index}: {Name}", index, agent.Name);
+        swResolve.Stop();
+
+        swTotal.Stop();
+        _logger.LogInformation(
+        "[SquadAgentPool] Built agent slot {Index}: {Name} — total {Total:F0}ms " +
+        "(builder {Builder:F0}ms, AddSquadAgent {Add:F0}ms, host.Build {Build:F0}ms, resolve {Resolve:F0}ms). " +
+        "NOTE: runtime NOT started yet (lazy on first CreateSessionAsync).",
+        index, agent.Name, swTotal.Elapsed.TotalMilliseconds,
+        swBuilder.Elapsed.TotalMilliseconds, swAdd.Elapsed.TotalMilliseconds,
+        swBuild.Elapsed.TotalMilliseconds, swResolve.Elapsed.TotalMilliseconds);
+        ProfileLog.Write(string.Format(System.Globalization.CultureInfo.InvariantCulture,
+            "[pool] slot {0} '{1}' build total={2:F0}ms (builder={3:F0} add={4:F0} host.Build={5:F0} resolve={6:F0}) [runtime NOT started yet]",
+            index, agent.Name, swTotal.Elapsed.TotalMilliseconds,
+            swBuilder.Elapsed.TotalMilliseconds, swAdd.Elapsed.TotalMilliseconds,
+            swBuild.Elapsed.TotalMilliseconds, swResolve.Elapsed.TotalMilliseconds));
         return new PooledSquadAgent(host, agent);
     }
 

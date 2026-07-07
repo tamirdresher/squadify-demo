@@ -59,7 +59,8 @@ Key MAF primitives on display:
 | `WithIntermediateOutputFrom` | Exposes the enricher's output as an intermediate result for the UI. |
 | `WithOpenTelemetry` | Instruments every executor invocation as a span. |
 | `[YieldsOutput(typeof(string))]` + `YieldOutputAsync` | The aggregator's final output. |
-| `InProcessExecution.RunStreamingAsync` + `WatchStreamAsync` | Streaming run — the app consumes `ExecutorInvokedEvent`, `ExecutorCompletedEvent`, `WorkflowOutputEvent`, etc. |
+| `InProcessExecution.Concurrent.RunStreamingAsync` + `WatchStreamAsync` | Streaming, **concurrency-safe** run — the app consumes `ExecutorInvokedEvent`, `ExecutorCompletedEvent`, `WorkflowOutputEvent`, etc. Multiple incidents run in parallel, each on its own root trace. |
+| Factory-bound `ExecutorBinding` (via a `Bind<T>` helper) | The concurrent runtime rejects shared, pre-instantiated executors, so each node is registered through a factory — every run gets a fresh, isolated executor. See [`docs/telemetry.md`](telemetry.md). |
 
 Two of the nodes are AI agents:
 

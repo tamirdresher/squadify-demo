@@ -54,53 +54,26 @@ public static class SquadifiedWorkflow
 
         // ── Build the executor nodes as FACTORY-BOUND bindings ──
         // MAF's Concurrent execution environment (InProcessExecution.Concurrent) refuses to run
-        // a graph whose executors are shared, pre-instantiated instances — it demands each
-        // executor be either "cross-run share-capable" or "factory-created" so every concurrent
-        // run gets its own fresh, isolated executor. We register each node via a factory delegate
-        // (Func<id, sessionId, ValueTask<TExecutor>>) using ExecutorBinding's BindExecutor helper.
-        // The per-run inputs (chatClient, squadFolder, pooledSquadAgent, logger) are captured in
-        // the closures; because RunWorkflowAsync builds a fresh workflow per run, each run's
-        // factories close over that run's own rented pooled agent.
-        ExecutorBinding validator =
-            new Func<string, string, ValueTask<ValidatorExecutor>>(
-                (id, _) => new ValueTask<ValidatorExecutor>(
-                    new ValidatorExecutor(id, BuildValidatorAgent(chatClient, logger), chatClient, logger)))
-            .BindExecutor("validator");
+        // a graph whose executors are shared, pre-instantiated instances — it demands each node be
+        // "factory-created" so every concurrent run gets its own fresh, isolated executor. The
+        // Bind<T> helper below wraps our simple `id => new SomeExecutor(id, ...)` factories in the
+        // Func<id, sessionId, ValueTask<TExecutor>> shape BindExecutor expects, so each node reads
+        // as a one-liner. The per-run inputs (chatClient, squadFolder, pooledSquadAgent, logger)
+        // are captured in the closures; because RunWorkflowAsync builds a fresh workflow per run,
+        // each run's factories close over that run's own rented pooled agent.
+        var validator  = Bind("validator",         id => new ValidatorExecutor(id, BuildValidatorAgent(chatClient, logger), chatClient, logger));
+        var squad      = Bind("squad-analysis",    id => new SquadExecutor(id, squadFolder, logger, pooledSquadAgent));
+        var enricher   = Bind("enricher",          id => new EnricherExecutor(id, logger));
+        var slack      = Bind("notify-slack",      id => new NotifierExecutor(id, "Slack #incidents", logger));
+        var pagerDuty  = Bind("notify-pagerduty",  id => new NotifierExecutor(id, "PagerDuty", logger));
+        var statusPage = Bind("notify-statuspage", id => new NotifierExecutor(id, "StatusPage", logger));
+        var aggregator = Bind("aggregator",        id => new NotificationAggregator(id, expected: 3));
 
-        ExecutorBinding squad =
-            new Func<string, string, ValueTask<SquadExecutor>>(
-                (id, _) => new ValueTask<SquadExecutor>(
-                    new SquadExecutor(id, squadFolder, logger, pooledSquadAgent)))
-            .BindExecutor("squad-analysis");
-
-        ExecutorBinding enricher =
-            new Func<string, string, ValueTask<EnricherExecutor>>(
-                (id, _) => new ValueTask<EnricherExecutor>(new EnricherExecutor(id, logger)))
-            .BindExecutor("enricher");
-
-        ExecutorBinding slack =
-            new Func<string, string, ValueTask<NotifierExecutor>>(
-                (id, _) => new ValueTask<NotifierExecutor>(
-                    new NotifierExecutor(id, "Slack #incidents", logger)))
-            .BindExecutor("notify-slack");
-
-        ExecutorBinding pagerDuty =
-            new Func<string, string, ValueTask<NotifierExecutor>>(
-                (id, _) => new ValueTask<NotifierExecutor>(
-                    new NotifierExecutor(id, "PagerDuty", logger)))
-            .BindExecutor("notify-pagerduty");
-
-        ExecutorBinding statusPage =
-            new Func<string, string, ValueTask<NotifierExecutor>>(
-                (id, _) => new ValueTask<NotifierExecutor>(
-                    new NotifierExecutor(id, "StatusPage", logger)))
-            .BindExecutor("notify-statuspage");
-
-        ExecutorBinding aggregator =
-            new Func<string, string, ValueTask<NotificationAggregator>>(
-                (id, _) => new ValueTask<NotificationAggregator>(
-                    new NotificationAggregator(id, expected: 3)))
-            .BindExecutor("aggregator");
+        // Local helper: turns a plain `id => executor` factory into the factory-bound
+        // ExecutorBinding that MAF's concurrent runtime requires. Keeps the graph readable.
+        static ExecutorBinding Bind<T>(string id, Func<string, T> create) where T : Executor
+            => new Func<string, string, ValueTask<T>>((execId, _) => new ValueTask<T>(create(execId)))
+                .BindExecutor(id);
 
         // ── Wire the DAG with real WorkflowBuilder edges ──
         var workflow = new WorkflowBuilder(validator)
@@ -331,13 +304,41 @@ public static class SquadifiedWorkflow
         {
             try
             {
+                // ── TIMING INSTRUMENTATION ──
+                // Isolates the two costs that make up a Squad run so we can decide whether a
+                // single shared CopilotClient would actually help:
+                //   • session   = CreateSessionAsync(). Because `new CopilotClient()` is lazy
+                //     (decompiled 0.5.5: no StartAsync in the ctor), the FIRST session on a
+                //     freshly-built agent is where the CLI runtime subprocess spawns + the auth
+                //     handshake happens. This is the part a shared, pre-started client would pay
+                //     ONCE instead of once-per-agent.
+                //   • stream    = RunStreamingAsync loop = LLM inference + sub-agent dispatch.
+                //     This is per-run work that a shared client does NOT eliminate.
+                var swSession = Stopwatch.StartNew();
                 var session = await squad.CreateSessionAsync();
+                swSession.Stop();
+                _logger.LogInformation(
+                    "[squad-analysis] ⏱️  CreateSessionAsync (lazy runtime start on first use): {Ms:F0}ms",
+                    swSession.Elapsed.TotalMilliseconds);
+                ProfileLog.Write(string.Format(System.Globalization.CultureInfo.InvariantCulture,
+                    "[run] '{0}' CreateSessionAsync (lazy runtime start)={1:F0}ms",
+                    squad.Name, swSession.Elapsed.TotalMilliseconds));
+
+                var swStream = Stopwatch.StartNew();
                 var responseText = new System.Text.StringBuilder();
                 await foreach (var update in squad.RunStreamingAsync(validatedAlert, session))
                 {
                     if (!string.IsNullOrEmpty(update.Text))
                         responseText.Append(update.Text);
                 }
+                swStream.Stop();
+                _logger.LogInformation(
+                    "[squad-analysis] ⏱️  RunStreamingAsync (LLM inference + sub-agents): {Ms:F0}ms",
+                    swStream.Elapsed.TotalMilliseconds);
+                ProfileLog.Write(string.Format(System.Globalization.CultureInfo.InvariantCulture,
+                    "[run] '{0}' RunStreamingAsync (LLM + sub-agents)={1:F0}ms  session+stream total={2:F0}ms",
+                    squad.Name, swStream.Elapsed.TotalMilliseconds,
+                    swSession.Elapsed.TotalMilliseconds + swStream.Elapsed.TotalMilliseconds));
 
                 var analysisResult = responseText.ToString();
                 if (string.IsNullOrWhiteSpace(analysisResult))

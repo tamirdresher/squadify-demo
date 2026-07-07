@@ -162,15 +162,22 @@ executors at DAG-build time:
 > *Workflow must only consist of cross-run share-capable or factory-created executors…*
 
 The fix is to register every executor through a **factory** so each run gets a fresh instance.
-`BindExecutor` takes a `Func<string, string, ValueTask<TExecutor>>` (params are `(id, sessionId)`),
-invoked per run:
+`BindExecutor` takes a `Func<string, string, ValueTask<TExecutor>>` (params are `(id, sessionId)`).
+Written out longhand, seven of those factory bindings turn into a wall of `new Func<...>(...)`
+boilerplate that buries the actual graph. A tiny local `Bind<T>` helper collapses each node back to a
+one-liner while still producing the exact factory shape MAF's concurrent runtime demands:
 
 ```csharp
-ExecutorBinding validator =
-    new Func<string, string, ValueTask<ValidatorExecutor>>(
-        (id, _) => new ValueTask<ValidatorExecutor>(
-            new ValidatorExecutor(id, BuildValidatorAgent(chatClient, logger), chatClient, logger)))
-    .BindExecutor("validator");
+// Local helper: wraps a plain `id => executor` factory in the factory-bound
+// ExecutorBinding the concurrent runtime requires. Keeps the graph readable.
+static ExecutorBinding Bind<T>(string id, Func<string, T> create) where T : Executor
+    => new Func<string, string, ValueTask<T>>((execId, _) => new ValueTask<T>(create(execId)))
+        .BindExecutor(id);
+
+var validator  = Bind("validator",      id => new ValidatorExecutor(id, BuildValidatorAgent(chatClient, logger), chatClient, logger));
+var squad      = Bind("squad-analysis", id => new SquadExecutor(id, squadFolder, logger, pooledSquadAgent));
+var enricher   = Bind("enricher",       id => new EnricherExecutor(id, logger));
+// …notifiers + aggregator bound the same way
 ```
 
 Because `RunWorkflowAsync` builds a fresh workflow per run, each run's factory closures capture that

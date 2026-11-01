@@ -72,7 +72,9 @@ For a reproducible rehearsal, use a throwaway worktree based on this feature bra
 
 ```powershell
 # Choose a new, absent path. Do not use the original checkout or an app-managed worktree.
-$rehearsal = Join-Path $env:TEMP 'squadify-prague-rehearsal'
+$rehearsalRoot = Join-Path $HOME 'source\rehearsals'
+New-Item -ItemType Directory -Path $rehearsalRoot -Force | Out-Null
+$rehearsal = Join-Path $rehearsalRoot 'squadify-prague-rehearsal'
 git worktree add -b rehearsal/prague-reliability $rehearsal tamirdresher-microsoft-update-prague-2026
 Set-Location $rehearsal
 ```

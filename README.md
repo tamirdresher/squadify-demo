@@ -123,6 +123,8 @@ cd squadify-demo
 dotnet restore .\SquadifyDemo.slnx --configfile .\NuGet.Config
 dotnet build .\SquadifyDemo.slnx --no-restore
 dotnet test .\SquadifyDemo.Tests\SquadifyDemo.Tests.csproj --no-restore
+# UI class/CSS routing regressions (Node.js 22+, built-in runner, no npm dependencies):
+node --test .\SquadifyDemo.Tests\ui-regressions.cjs
 ```
 
 NuGet and the SDK's bundled Copilot CLI download use Microsoft CFS proxies by default

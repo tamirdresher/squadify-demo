@@ -169,8 +169,20 @@
             overflow-y: auto;
         }
         .final-result {
+            background: var(--code-bg);
+            border-color: var(--border);
+        }
+        .final-result--completed {
             background: linear-gradient(135deg, #1a2a1a, #1a2a2a);
             border-color: var(--success);
+        }
+        .final-result--failed {
+            background: linear-gradient(135deg, #2a1a1a, #2a1a25);
+            border-color: var(--danger);
+        }
+        .final-result--cancelled {
+            background: linear-gradient(135deg, #2a241a, #2a2a1a);
+            border-color: var(--warning);
         }
         .empty-state {
             text-align: center;
@@ -363,6 +375,8 @@
         function renderRunCard(run) {
             const mine = triggeredRunIds.has(run.runId);
             const st = (run.status || 'Running').toLowerCase();
+            const resultClass = ['completed', 'failed', 'cancelled'].includes(st)
+                ? `final-result final-result--${st}` : 'final-result';
             const statusColor = st === 'completed' ? '#22c55e' : st === 'failed' ? '#ef4444' : '#f59e0b';
             const dur = run.durationMs ? Math.round(run.durationMs / 1000) + 's'
                       : (st === 'completed' || st === 'failed' || st === 'cancelled') ? '—' : '⏳ running';
@@ -372,7 +386,7 @@
             for (const step of (run.steps || [])) {
                 const typeClass = step.type === 'squad-analysis' ? 'active' : '';
                 steps += `
-                    <div class="step-card ${step.step === 'FinalResult' ? 'final-result' : ''}">
+                    <div class="step-card ${step.step === 'FinalResult' ? resultClass : ''}">
                         <div class="step-header">
                             <span class="step-name">${getStepIcon(step.type)} ${escapeHtml(step.step)}</span>
                             <span class="step-type ${typeClass}">${escapeHtml(step.type)}</span>
@@ -382,7 +396,7 @@
             }
             if (run.finalResult) {
                 steps += `
-                    <div class="step-card final-result">
+                    <div class="step-card ${resultClass}">
                         <div class="step-header"><span class="step-name">🏁 Final Result</span></div>
                         <div class="step-output">${escapeHtml(run.finalResult)}</div>
                     </div>`;

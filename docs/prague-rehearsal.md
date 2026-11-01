@@ -50,6 +50,7 @@ dotnet --info
 dotnet restore .\SquadifyDemo.slnx --configfile .\NuGet.Config
 dotnet build .\SquadifyDemo.slnx --no-restore
 dotnet test .\SquadifyDemo.Tests\SquadifyDemo.Tests.csproj --no-restore
+node --test .\SquadifyDemo.Tests\ui-regressions.cjs
 dotnet test .\SquadifyDemo.Tests\SquadifyDemo.Tests.csproj --no-restore --filter 'FullyQualifiedName~SquadFailureOrEmptyResponseFailsTheRealDag'
 dotnet test .\SquadifyDemo.Tests\SquadifyDemo.Tests.csproj --no-restore --filter 'FullyQualifiedName~Pool|FullyQualifiedName~Cancellation|FullyQualifiedName~Liveness'
 dotnet list .\SquadifyDemo.slnx package --vulnerable --include-transitive --no-restore
@@ -58,6 +59,10 @@ dotnet list .\SquadifyDemo.slnx package --vulnerable --include-transitive --no-r
 NuGet and the SDK's build-time CLI download use Microsoft CFS. Tests use synthetic chat
 clients, an in-process HTTP server, and a real in-process MAF graph; they do not prove
 Copilot authentication, live sub-agent dispatch, model quality, or GitHub delivery.
+The UI tests require Node.js 22+ and its built-in runner, with no npm dependencies.
+They execute the actual inline JavaScript and inspect its class routing and CSS rules:
+Completed details are green, Failed red, Cancelled amber, and nonterminal details neutral.
+This is not a browser screenshot or computed-layout test.
 
 **Red/green witness, 2026-11-01:** temporarily restoring the original catch-and-return
 behavior in the fixed tree made both synthetic Squad failure cases fail with

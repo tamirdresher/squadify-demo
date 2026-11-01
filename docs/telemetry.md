@@ -7,11 +7,10 @@ dashboard. This doc explains the telemetry chain, why the Squad span looks diffe
 
 ## The trace tree
 
-A single "Trigger Incident" run produces a trace shaped like this:
+A single run starts a separate root trace (the HTTP trigger span is separate):
 
 ```
-POST /incidents/simulate                         (ASP.NET Core span)
-└─ workflow run                                   (SquadifyDemo.Workflow)
+SquadifyWorkflow                                  (SquadifyDemo)
    ├─ validator                                   (executor span)
    │  └─ chat  gpt-... / phi-4                     (GenAI span — Experimental.Microsoft.Extensions.AI)
    ├─ squad-analysis                              (our explicit parent span)
@@ -137,17 +136,25 @@ Every run carries a distinct `runId`, and its executor spans (`validator` → `s
 
 ### 2. Warm agent pool — cold-start reuse
 
-Building a `SquadAgent` (which boots the Copilot CLI subprocess and loads the team) is expensive.
-Previously that cost was paid on **every** run. Now a `SquadAgentPool` pre-builds a bounded set of
-warm agents at startup via a `BackgroundService` (`SquadAgentPoolWarmer`), and each Demo-3 run
-**rents** a ready agent instead of constructing one:
+`SquadAgentPool` builds reusable agent hosts at startup via `SquadAgentPoolWarmer`.
+It does **not** start/authenticate the Copilot CLI then: session creation starts the runtime
+lazily. Each Demo-3 run rents an initialized slot and creates a fresh session:
 
 - Pool size is configurable with `SQUAD_POOL_SIZE` (default **3**).
 - `RentAsync` hands out a warm agent; `Return` puts it back for the next run.
 - The pool doubles as a concurrency cap — no more agents run at once than the pool holds.
 
-**Measured impact:** first (cold) run ≈ **280,724 ms**; a warmed run ≈ **141,928 ms** — about a
-**49% reduction** in end-to-end time once the pool is primed.
+**Historical measurements, not a current guarantee:** a previous run recorded 280,724 ms cold
+versus 141,928 ms reused. These have not been remeasured for the Prague preparation.
+`/ready` checks slot initialization only, not Copilot/model access. Initialization failure
+unblocks renters with an exception; cancelled waits and agent calls receive the shutdown token.
+
+Workflow error events, Squad exceptions, empty analysis and missing final notification output
+are failures. `/status`, `/trace` and the UI distinguish Failed from Cancelled and Completed.
+Shutdown cancellation uses an error activity status plus `workflow.cancelled=true`, not OK.
+The in-memory `/trace` step summaries are recorded after the DAG finishes, not live executor
+events; use actual Aspire traces for execution evidence. Prompt/response telemetry is enabled:
+use synthetic data only. See [Prague rehearsal](prague-rehearsal.md) for deterministic regressions.
 
 ### 3. True concurrent execution
 

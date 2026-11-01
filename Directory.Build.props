@@ -1,0 +1,5 @@
+<Project>
+  <PropertyGroup>
+    <CopilotNpmRegistryUrl Condition="'$(CopilotNpmRegistryUrl)' == ''">https://packagefeedproxy.microsoft.io/npm</CopilotNpmRegistryUrl>
+  </PropertyGroup>
+</Project>

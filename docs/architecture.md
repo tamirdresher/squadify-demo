@@ -31,6 +31,10 @@ var workflow = builder.AddProject<Projects.SquadifyDemo>("squadify-workflow")
 - **`WithHttpCommand`** adds dashboard buttons that POST to app endpoints — the demo's "Trigger
   Incident" button lives here.
 
+The Squad resource is metadata, not a separately supervised Copilot process. Its `Active`
+dashboard state does not establish runtime/model readiness. Foundry Local serves the in-process
+chat client only; the Squad node still uses Copilot CLI and its model service.
+
 ### 2. MAF workflow — the DAG
 
 [`SquadifyDemo/Agents/SquadifiedWorkflow.cs`](../SquadifyDemo/Agents/SquadifiedWorkflow.cs) builds a
@@ -129,3 +133,13 @@ an external checkout would break clone-and-run. We **vendored** a self-contained
 [`src/CommunityToolkit.Aspire.Hosting.Squad/`](../src/CommunityToolkit.Aspire.Hosting.Squad/). Its
 only external dependency is `Aspire.Hosting`. In production, prefer the package reference once it
 ships.
+
+## Reliability boundary
+
+The web app is a synthetic teaching sample with in-memory runs/traces and an unbounded trigger
+queue. Remediation tools simulate actions; notification executors format messages without sending
+them. Pool initialization/readiness, shutdown cancellation, and failure propagation are explicit,
+but there is no durable workflow recovery, automated retry, approval service, or production SLO.
+`/health` is liveness; `/ready` covers initialized slots, not CLI authentication. The root
+`.squad` describes the incident team, not the engineering team that develops this repository.
+See [Prague rehearsal](prague-rehearsal.md) for that separate setup and known dependency advisories.

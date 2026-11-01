@@ -47,7 +47,8 @@ public static class SquadifiedWorkflow
     /// </param>
     public static async Task<string> RunWorkflowAsync(
         string alertInput, string squadFolder, ILogger logger,
-        IChatClient? chatClient = null, SquadAgent? pooledSquadAgent = null)
+        IChatClient? chatClient = null, AIAgent? pooledSquadAgent = null,
+        CancellationToken cancellationToken = default)
     {
         logger.LogInformation("Building squadified MAF workflow (WorkflowBuilder DAG)...");
         logger.LogInformation("  Graph: [validator] → [squad-analysis] → [enricher] → fan-out{{slack,pagerduty,statuspage}} → barrier → [aggregator]");
@@ -89,16 +90,23 @@ public static class SquadifiedWorkflow
         logger.LogInformation("[Workflow] ▶️  Streaming run started...");
 
         // ── Run and consume the event stream ──
-        string enriched = "";
-        string notifications = "";
-
         // Use the purpose-built Concurrent execution environment so multiple workflow
         // runs can execute in parallel. Each run builds a FRESH workflow instance above,
         // and the Concurrent environment (enableConcurrentRuns: true) does not take an
         // exclusive ownership lock on the workflow — so concurrent runs don't serialize.
-        await using var run = await InProcessExecution.Concurrent.RunStreamingAsync(workflow, alertInput);
-        await foreach (var evt in run.WatchStreamAsync())
+        await using var run = await InProcessExecution.Concurrent.RunStreamingAsync(workflow, alertInput,
+            cancellationToken: cancellationToken);
+        return await ReadOutputAsync(run.WatchStreamAsync(cancellationToken), logger, cancellationToken);
+    }
+
+    internal static async Task<string> ReadOutputAsync(
+        IAsyncEnumerable<WorkflowEvent> events, ILogger logger, CancellationToken cancellationToken = default)
+    {
+        string enriched = "";
+        string notifications = "";
+        await foreach (var evt in events.WithCancellation(cancellationToken))
         {
+            cancellationToken.ThrowIfCancellationRequested();
             switch (evt)
             {
                 case ExecutorInvokedEvent e:
@@ -108,8 +116,7 @@ public static class SquadifiedWorkflow
                     logger.LogInformation("[Workflow] ✅ {Id}", e.ExecutorId);
                     break;
                 case WorkflowErrorEvent e:
-                    logger.LogWarning(e.Exception, "[Workflow] ⚠️  workflow error");
-                    break;
+                    throw new InvalidOperationException("Squadified workflow execution failed.", e.Exception);
                 case WorkflowOutputEvent e:
                     var text = e.As<string>() ?? "";
                     if (e.IsIntermediate())
@@ -120,15 +127,15 @@ public static class SquadifiedWorkflow
             }
         }
 
-        logger.LogInformation("✅ Workflow completed.");
+        cancellationToken.ThrowIfCancellationRequested();
+        if (string.IsNullOrWhiteSpace(notifications))
+            throw new InvalidOperationException("Squadified workflow completed without final notification output.");
 
-        // Combine the enriched analysis with the notification report for the UI.
+        logger.LogInformation("Workflow completed with final output.");
         if (string.IsNullOrWhiteSpace(enriched))
-            return string.IsNullOrWhiteSpace(notifications) ? "Workflow produced no output." : notifications;
+            return notifications;
 
-        return string.IsNullOrWhiteSpace(notifications)
-            ? enriched
-            : enriched + "\n\n" + notifications;
+        return enriched + "\n\n" + notifications;
     }
 
     // ═══════════════════════════════════════════════════════════════
@@ -202,7 +209,7 @@ public static class SquadifiedWorkflow
                     : $"⚠️ Alert not classified as actionable (deterministic fallback), continuing for demo.\n\n{rawAlert}";
             }
 
-            var response = await _agent.RunAsync($"Alert: {rawAlert}");
+            var response = await _agent.RunAsync($"Alert: {rawAlert}", cancellationToken: cancellationToken);
             var result = response.Text ?? "";
             _logger.LogInformation("[validator] → {Result}", result.Split('\n').FirstOrDefault()?.Trim() ?? "classified");
 
@@ -219,9 +226,9 @@ public static class SquadifiedWorkflow
     {
         private readonly string _squadFolder;
         private readonly ILogger _logger;
-        private readonly SquadAgent? _pooledAgent;
+        private readonly AIAgent? _pooledAgent;
 
-        public SquadExecutor(string id, string squadFolder, ILogger logger, SquadAgent? pooledAgent = null) : base(id)
+        public SquadExecutor(string id, string squadFolder, ILogger logger, AIAgent? pooledAgent = null) : base(id)
         {
             _squadFolder = squadFolder;
             _logger = logger;
@@ -244,7 +251,7 @@ public static class SquadifiedWorkflow
             if (_pooledAgent is not null)
             {
                 _logger.LogInformation("[squad-analysis] ♻️  Reusing warm pooled Squad agent: {Name}", _pooledAgent.Name);
-                return await RunWithAgentAsync(_pooledAgent, validatedAlert);
+                return await RunWithAgentAsync(_pooledAgent, validatedAlert, cancellationToken);
             }
 
             // COLD PATH (fallback): build a dedicated host + agent for this run and dispose it after.
@@ -287,7 +294,7 @@ public static class SquadifiedWorkflow
 
             try
             {
-                return await RunWithAgentAsync(squad, validatedAlert);
+                return await RunWithAgentAsync(squad, validatedAlert, cancellationToken);
             }
             finally
             {
@@ -300,7 +307,7 @@ public static class SquadifiedWorkflow
         /// Shared run logic: open a fresh session on the given Squad agent, stream the analysis,
         /// and return the accumulated text. Used by both the warm (pooled) and cold (build-own) paths.
         /// </summary>
-        private async Task<string> RunWithAgentAsync(SquadAgent squad, string validatedAlert)
+        private async Task<string> RunWithAgentAsync(AIAgent squad, string validatedAlert, CancellationToken cancellationToken)
         {
             try
             {
@@ -315,7 +322,7 @@ public static class SquadifiedWorkflow
                 //   • stream    = RunStreamingAsync loop = LLM inference + sub-agent dispatch.
                 //     This is per-run work that a shared client does NOT eliminate.
                 var swSession = Stopwatch.StartNew();
-                var session = await squad.CreateSessionAsync();
+                var session = await squad.CreateSessionAsync(cancellationToken: cancellationToken);
                 swSession.Stop();
                 _logger.LogInformation(
                     "[squad-analysis] ⏱️  CreateSessionAsync (lazy runtime start on first use): {Ms:F0}ms",
@@ -326,7 +333,7 @@ public static class SquadifiedWorkflow
 
                 var swStream = Stopwatch.StartNew();
                 var responseText = new System.Text.StringBuilder();
-                await foreach (var update in squad.RunStreamingAsync(validatedAlert, session))
+                await foreach (var update in squad.RunStreamingAsync(validatedAlert, session, cancellationToken: cancellationToken))
                 {
                     if (!string.IsNullOrEmpty(update.Text))
                         responseText.Append(update.Text);
@@ -342,15 +349,19 @@ public static class SquadifiedWorkflow
 
                 var analysisResult = responseText.ToString();
                 if (string.IsNullOrWhiteSpace(analysisResult))
-                    analysisResult = "(Squad agent returned empty response)";
+                    throw new InvalidOperationException("Squad agent returned no analysis.");
 
                 _logger.LogInformation("[squad-analysis] → Analysis complete ({Length} chars)", analysisResult.Length);
                 return analysisResult;
             }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                throw;
+            }
             catch (Exception ex)
             {
                 _logger.LogWarning(ex, "[squad-analysis] Squad agent error");
-                return $"Analysis unavailable — Squad agent error: {ex.Message}";
+                throw;
             }
         }
     }

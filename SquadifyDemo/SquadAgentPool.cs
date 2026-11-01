@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Threading.Channels;
+using Microsoft.Agents.AI;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
@@ -8,28 +9,17 @@ using Squad.Agents.AI;
 namespace SquadifyDemo;
 
 /// <summary>
-/// A warm pool of pre-built <see cref="SquadAgent"/> instances.
+/// A bounded pool of reusable <see cref="SquadAgent"/> instances.
 ///
 /// <para>
-/// COLD-START PROBLEM: Building a Squad agent means creating a whole
-/// <see cref="Host"/>, wiring <c>AddSquadAgent(...)</c>, and (on first use)
-/// spawning a Copilot CLI subprocess. The original demo did all of this
-/// <em>inside every workflow run</em> and disposed the host afterwards, so
-/// every incident paid the full cold-start cost (~280s observed).
+/// Startup builds the agent hosts, not the Copilot runtime. The CLI starts lazily
+/// on first session creation; successful slot initialization does not verify authentication
+/// or model access. Later runs reuse the same agent with a fresh session.
 /// </para>
 ///
 /// <para>
-/// FIX: build N agents once at startup and keep their hosts alive. Runs rent
-/// an idle agent, use it, and return it — no per-run host build, no dispose.
-/// The heavy <c>Host.Build()</c> + <c>AddSquadAgent</c> cost is moved off the
-/// run path, and the CLI subprocess stays warm between runs. Reused runs were
-/// measured at ~142s (~49% faster than cold).
-/// </para>
-///
-/// <para>
-/// The idle set is a bounded <see cref="Channel{T}"/> of size N. <see cref="RentAsync"/>
-/// blocks when the pool is empty, so it doubles as natural backpressure —
-/// concurrency is capped at the pool size without any extra semaphore.
+/// Renting awaits initialization and an idle slot with cancellation. Initialization failure
+/// releases waiters with an explicit error. This bounds Demo-3 agent use, not the HTTP backlog.
 /// </para>
 /// </summary>
 public sealed class SquadAgentPool : IAsyncDisposable
@@ -39,6 +29,9 @@ public sealed class SquadAgentPool : IAsyncDisposable
     private readonly string _squadFolder;
     private readonly ILogger<SquadAgentPool> _logger;
     private readonly int _size;
+    private readonly Func<int, PooledSquadAgent> _buildAgent;
+    private readonly TaskCompletionSource<Exception?> _initialization = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private int _initializationStarted;
 
     public SquadAgentPool(WorkflowConfig config, ILogger<SquadAgentPool> logger, int size)
     {
@@ -46,42 +39,71 @@ public sealed class SquadAgentPool : IAsyncDisposable
         _logger = logger;
         _size = Math.Max(1, size);
         _idle = Channel.CreateBounded<PooledSquadAgent>(_size);
+        _buildAgent = BuildOne;
     }
 
-    /// <summary>Number of warm agents this pool maintains (also the concurrency cap for Squad runs).</summary>
+    internal SquadAgentPool(WorkflowConfig config, ILogger<SquadAgentPool> logger, int size,
+        Func<int, PooledSquadAgent> buildAgent) : this(config, logger, size)
+        => _buildAgent = buildAgent;
+
+    /// <summary>Number of agent slots this pool maintains (also the concurrency cap for Squad runs).</summary>
     public int Size => _size;
+
+    public bool IsReady => _initialization.Task.IsCompletedSuccessfully && _initialization.Task.Result is null;
+    public string InitializationStatus => !_initialization.Task.IsCompleted ? "Initializing" : IsReady ? "Ready" : "Failed";
 
     /// <summary>
     /// Builds all pooled agents in parallel and marks them idle. Called once by the
-    /// hosted warmer at application startup so the first user-triggered run is fast.
+    /// hosted initializer at application startup. The first run still starts the CLI lazily.
     /// </summary>
     public async Task WarmUpAsync(CancellationToken cancellationToken = default)
     {
-        _logger.LogInformation("[SquadAgentPool] 🔥 Warming up {Size} Squad agents...", _size);
+        if (Interlocked.Exchange(ref _initializationStarted, 1) != 0)
+            throw new InvalidOperationException("Squad agent pool initialization has already started.");
+
+        _logger.LogInformation("[SquadAgentPool] Preparing {Size} Squad agent slots (CLI starts lazily)...", _size);
         var started = Stopwatch.GetTimestamp();
 
         var builds = Enumerable.Range(0, _size)
-            .Select(i => Task.Run(() => BuildOne(i), cancellationToken))
+            .Select(i => Task.Run(() => _buildAgent(i), cancellationToken))
             .ToArray();
 
-        var agents = await Task.WhenAll(builds);
-        foreach (var agent in agents)
+        try
         {
-            _all.Add(agent);
-            await _idle.Writer.WriteAsync(agent, cancellationToken);
+            var agents = await Task.WhenAll(builds);
+            _all.AddRange(agents);
+            foreach (var agent in agents)
+                await _idle.Writer.WriteAsync(agent, cancellationToken);
+
+            _initialization.SetResult(null);
+        }
+        catch (Exception ex)
+        {
+            _initialization.TrySetResult(ex);
+            _idle.Writer.TryComplete(ex);
+            // Task.WhenAll has settled every build; release successful slots after partial failure.
+            foreach (var build in builds.Where(t => t.IsCompletedSuccessfully))
+                await build.Result.DisposeAsync();
+            _all.Clear();
+            throw;
         }
 
         _logger.LogInformation(
-            "[SquadAgentPool] ✅ {Size} agents warm in {Ms:F0}ms — runs will reuse them (no per-run cold start).",
+            "[SquadAgentPool] {Size} agent slots prepared in {Ms:F0}ms. Copilot authentication/runtime are not verified until first use.",
             _size, Stopwatch.GetElapsedTime(started).TotalMilliseconds);
         ProfileLog.Write(string.Format(System.Globalization.CultureInfo.InvariantCulture,
-            "[pool] WARM-UP COMPLETE: {0} agents built in {1:F0}ms (parallel)",
+            "[pool] SLOT INITIALIZATION COMPLETE: {0} agents built in {1:F0}ms (parallel), runtime not verified",
             _size, Stopwatch.GetElapsedTime(started).TotalMilliseconds));
     }
 
     /// <summary>Rents a warm agent. Blocks (backpressure) until one is idle.</summary>
-    public ValueTask<PooledSquadAgent> RentAsync(CancellationToken cancellationToken = default)
-        => _idle.Reader.ReadAsync(cancellationToken);
+    public async ValueTask<PooledSquadAgent> RentAsync(CancellationToken cancellationToken = default)
+    {
+        var error = await _initialization.Task.WaitAsync(cancellationToken);
+        if (error is not null)
+            throw new InvalidOperationException("Squad agent pool initialization failed.", error);
+        return await _idle.Reader.ReadAsync(cancellationToken);
+    }
 
     /// <summary>Returns an agent to the idle set for reuse by the next run.</summary>
     public void Return(PooledSquadAgent agent) => _idle.Writer.TryWrite(agent);
@@ -141,7 +163,16 @@ public sealed class SquadAgentPool : IAsyncDisposable
         swBuild.Stop();
 
         var swResolve = Stopwatch.StartNew();
-        var agent = host.Services.GetRequiredService<SquadAgent>();
+        SquadAgent agent;
+        try
+        {
+            agent = host.Services.GetRequiredService<SquadAgent>();
+        }
+        catch
+        {
+            host.Dispose();
+            throw;
+        }
         swResolve.Stop();
 
         swTotal.Stop();
@@ -162,6 +193,7 @@ public sealed class SquadAgentPool : IAsyncDisposable
 
     public async ValueTask DisposeAsync()
     {
+        _initialization.TrySetResult(new ObjectDisposedException(nameof(SquadAgentPool)));
         _idle.Writer.TryComplete();
         foreach (var agent in _all)
             await agent.DisposeAsync();
@@ -177,14 +209,14 @@ public sealed class PooledSquadAgent : IAsyncDisposable
 {
     private readonly IHost _host;
 
-    internal PooledSquadAgent(IHost host, SquadAgent agent)
+    internal PooledSquadAgent(IHost host, AIAgent agent)
     {
         _host = host;
         Agent = agent;
     }
 
     /// <summary>The warm Squad agent. Create a fresh session per run via <c>Agent.CreateSessionAsync()</c>.</summary>
-    public SquadAgent Agent { get; }
+    public AIAgent Agent { get; }
 
     public async ValueTask DisposeAsync()
     {
@@ -195,8 +227,7 @@ public sealed class PooledSquadAgent : IAsyncDisposable
 }
 
 /// <summary>
-/// Hosted service that warms the <see cref="SquadAgentPool"/> at application startup,
-/// so the pool is ready before the first incident is triggered.
+/// Initializes reusable slots at startup without starting Copilot sessions or model calls.
 /// </summary>
 public sealed class SquadAgentPoolWarmer : BackgroundService
 {
@@ -221,7 +252,7 @@ public sealed class SquadAgentPoolWarmer : BackgroundService
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "[SquadAgentPool] Warm-up failed — runs will fall back to per-run agent creation.");
+            _logger.LogError(ex, "[SquadAgentPool] Initialization failed. Readiness is unavailable and waiting runs will fail.");
         }
     }
 }

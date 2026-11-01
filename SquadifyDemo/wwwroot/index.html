@@ -288,7 +288,10 @@
 
             const params = new URLSearchParams({ title, severity, demo });
             fetch(`/incidents/simulate?${params}`, { method: 'POST' })
-                .then(r => r.json())
+                .then(async r => {
+                    if (!r.ok) throw new Error(await r.text());
+                    return r.json();
+                })
                 .then(data => {
                     if (data.runId) triggeredRunIds.add(data.runId);
                     startPolling();
@@ -323,11 +326,17 @@
                     idlePolls = 0;
                     setStatus('running', `${active} workflow run(s) executing concurrently…`);
                 } else {
-                    setStatus('completed', runs.length ? '✅ All runs complete' : 'Ready — waiting for incident');
+                    const failed = runs.filter(r => r.status === 'Failed').length;
+                    const cancelled = runs.filter(r => r.status === 'Cancelled').length;
+                    if (failed || cancelled) {
+                        setStatus('failed', `No active runs. ${failed} failed, ${cancelled} cancelled. Inspect run details.`);
+                    } else {
+                        setStatus('completed', runs.length ? '✅ All runs complete' : 'Ready — waiting for incident');
+                    }
                     // Poll a couple more times after idle to catch final trace writes, then stop.
                     if (++idlePolls >= 2) stopPolling();
                 }
-            } catch (e) { /* ignore transient fetch errors */ }
+            } catch (e) { setStatus('failed', `Refresh failed: ${e.message}`); }
         }
 
         // Merge /status active runs (may be Queued with no trace yet) with /trace runs (have steps).
@@ -356,7 +365,7 @@
             const st = (run.status || 'Running').toLowerCase();
             const statusColor = st === 'completed' ? '#22c55e' : st === 'failed' ? '#ef4444' : '#f59e0b';
             const dur = run.durationMs ? Math.round(run.durationMs / 1000) + 's'
-                      : (st === 'completed' || st === 'failed') ? '—' : '⏳ running';
+                      : (st === 'completed' || st === 'failed' || st === 'cancelled') ? '—' : '⏳ running';
             const shortId = (run.runId || '').slice(0, 8);
 
             let steps = '';
@@ -371,7 +380,7 @@
                         <div class="step-output">${escapeHtml(step.output)}</div>
                     </div>`;
             }
-            if (run.finalResult && st === 'completed') {
+            if (run.finalResult) {
                 steps += `
                     <div class="step-card final-result">
                         <div class="step-header"><span class="step-name">🏁 Final Result</span></div>

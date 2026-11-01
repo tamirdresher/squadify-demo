@@ -8,6 +8,12 @@ sub-agent activity light up as OpenTelemetry spans in the Aspire dashboard.
 
 It is the companion demo for the **"Squadify Your App"** talk.
 
+For **Update Prague 2026**, this application is a supporting code artifact for the
+engineering-team talk, not a production incident service. See
+[`docs/prague-rehearsal.md`](docs/prague-rehearsal.md) for a copyable reliability issue,
+synthetic regression commands, engineering-team prerequisites, and known dependency advisories.
+The root `.squad` is an **incident-response team**, not a configured architect/developer/tester/reviewer team.
+
 > **TL;DR** — One MAF `WorkflowBuilder` DAG. One of its nodes is a whole Squad AI team
 > (Copilot CLI + specialist sub-agents). Aspire hosts it, wires OpenTelemetry, and gives you
 > distributed traces, logs, and a GenAI view for free.
@@ -24,8 +30,13 @@ It is the companion demo for the **"Squadify Your App"** talk.
 3. **Aspire hosting + observability** — a custom `AddSquad(...)` Aspire resource surfaces the team
    in the dashboard, and OpenTelemetry wiring means every executor invocation, agent call, and
    sub-agent dispatch becomes a span you can inspect.
-4. **Model flexibility** — runs against **Azure OpenAI** when configured, or falls back to
-   **Foundry Local** (Phi-4, on-device, no cloud required).
+4. **Validator model flexibility** — uses **Azure OpenAI** when configured, or
+   **Foundry Local** (Phi-4, on-device). The Squad node still requires authenticated
+   Copilot CLI and its model service; Foundry Local does not make the entire workflow offline.
+
+The logs, service health, remediation tools, operational context, and notification messages
+are synthetic. No database process is killed, pool restarted, or Slack/PagerDuty/StatusPage
+message sent. State and UI traces are in memory; there is no durable queue or restart recovery.
 
 ---
 
@@ -95,28 +106,46 @@ Squad span looks different from an in-process `ChatClientAgent` span — see
   (`copilot` on your PATH). The Squad team runs on top of it.
 - **A model provider — pick one:**
   - **Azure OpenAI** — set `AZURE_OPENAI_ENDPOINT` (+ `AZURE_OPENAI_KEY`), see below. Fast, recommended for the demo.
-  - **Foundry Local** — nothing to configure; the AppHost starts Foundry Local with **Phi-4** automatically. On-device, no cloud, but slower.
+  - **Foundry Local** — the AppHost starts Phi-4 automatically; first use may download the model.
+    Only the validator/model-client path is local; the Squad node still needs Copilot.
+- **Aspire CLI** for isolated AppHost startup.
 - **Docker / a container runtime** is **not** required for the core demo.
 
 ---
 
 ## Getting started
 
-```bash
+```powershell
 git clone https://github.com/tamirdresher/squadify-demo.git
 cd squadify-demo
 
-# (optional) point at Azure OpenAI for faster, higher-quality runs:
-dotnet user-secrets --project SquadifyDemo.AppHost set AZURE_OPENAI_ENDPOINT "https://<your>.openai.azure.com/"
-dotnet user-secrets --project SquadifyDemo.AppHost set AZURE_OPENAI_KEY "<your-key>"
-
-# run the Aspire AppHost (starts the dashboard, the workflow app, and — if no Azure — Foundry Local)
-$env:ASPIRE_ALLOW_UNSECURED_TRANSPORT="true"     # PowerShell; use export on bash/zsh
-dotnet run --project SquadifyDemo.AppHost/SquadifyDemo.AppHost.csproj
+# No model calls: restore/build and synthetic regression tests.
+dotnet restore .\SquadifyDemo.slnx --configfile .\NuGet.Config
+dotnet build .\SquadifyDemo.slnx --no-restore
+dotnet test .\SquadifyDemo.Tests\SquadifyDemo.Tests.csproj --no-restore
 ```
 
-If `AZURE_OPENAI_ENDPOINT` is not set, the AppHost falls back to Foundry Local + Phi-4 — the first
-run will download the model.
+NuGet and the SDK's bundled Copilot CLI download use Microsoft CFS proxies by default
+(`NuGet.Config`, `Directory.Build.props`). The test suite uses synthetic chat clients
+and an in-process HTTP test server; it does not start Copilot or Foundry.
+
+**Optional, operator-approved live rehearsal** (may download a model and incurs model-service usage
+when workflows are triggered):
+
+```powershell
+# For Azure, supply AZURE_OPENAI_ENDPOINT and AZURE_OPENAI_KEY securely in this process.
+# The current Azure deployment name is gpt-4o-mini. Never put real keys in source or slides.
+# Isolated startup does not reuse the AppHost's normal user-secrets.
+aspire start --isolated --non-interactive --apphost .\SquadifyDemo.AppHost\SquadifyDemo.AppHost.csproj
+aspire wait squadify-workflow --status up --non-interactive --apphost .\SquadifyDemo.AppHost\SquadifyDemo.AppHost.csproj
+aspire describe --non-interactive --apphost .\SquadifyDemo.AppHost\SquadifyDemo.AppHost.csproj
+```
+
+Inspect `/ready` at the discovered workflow URL before triggering. `/health` is liveness only;
+`/ready` returns 503 during initialization/failure and 200 once reusable slots exist. It does
+**not** verify Copilot authentication, model availability, or that a CLI process is warm.
+After rehearsal, stop only this AppHost with `aspire stop --non-interactive --apphost
+.\SquadifyDemo.AppHost\SquadifyDemo.AppHost.csproj` (not `--all`).
 
 ---
 
@@ -154,11 +183,11 @@ clean trace — without paying the Squad cold-start cost on every run.
   times back-to-back. Each run executes on its own `Task.Run`, the endpoint returns **202 Accepted**
   immediately with a fresh `runId`, and `/status` reports the live `activeCount`. Under the hood the
   workflow uses MAF's `InProcessExecution.Concurrent.RunStreamingAsync`.
-- **A warm agent pool kills the per-run cold start.** Building a `SquadAgent` (which boots the Copilot
-  CLI subprocess and loads the team) is expensive. A `SquadAgentPool` pre-builds a bounded set of warm
-  agents at startup via a `BackgroundService`, and each run **rents** a ready agent instead of building
-  one. Pool size is configurable with `SQUAD_POOL_SIZE` (default **3**), and the pool doubles as the
-  concurrency cap. Measured impact: first cold run ≈ 280 s vs a warmed run ≈ 142 s (~49% faster).
+- **Reusable agent slots, not a preauthenticated CLI.** `SquadAgentPool` constructs agent hosts
+  at startup; CLI startup/authentication happen lazily on the first session. Each Demo-3 run rents
+  one slot and returns it in `finally`. `SQUAD_POOL_SIZE` (default **3**) caps simultaneous Demo-3
+  agent use, not the unbounded request backlog or Demo-1/2 execution. Initialization failures
+  release waiting runs with an error; waits and model calls receive the shutdown token.
 - **One trace per run.** Each run starts its own root `Activity`, so the Aspire dashboard shows a
   **separate trace per incident** instead of one merged giant trace. `/trace` returns the array of
   runs; `/trace/{runId}` returns a single run.
@@ -168,6 +197,11 @@ clean trace — without paying the Squad cold-start cost on every run.
 
 See [`docs/telemetry.md`](docs/telemetry.md) for the trace shapes, the `Bind<T>` pattern, and the
 live concurrency verification.
+
+Failures (including empty Squad/final workflow output) are **Failed**, not a successful analysis
+string. Shutdown cancellation is **Cancelled**, not Completed; cancelled activities are not marked
+OK. The UI displays terminal errors and cancellations. These are lifecycle fixes, not automatic
+retry, durable recovery, or a production-readiness guarantee.
 
 ---
 

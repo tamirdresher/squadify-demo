@@ -128,8 +128,17 @@ public static class SquadifyWebProgram
         app.UseDefaultFiles();
         app.UseStaticFiles();
 
-        // ── Endpoints (matching community toolkit pattern) ────────────────
+        MapEndpoints(app);
+        await app.RunAsync();
+        return 0;
+    }
+
+    internal static void MapEndpoints(WebApplication app)
+    {
         app.MapGet("/health", () => Results.Ok("healthy"));
+        app.MapGet("/ready", (SquadAgentPool pool) => Results.Json(
+            new { ready = pool.IsReady, pool = pool.InitializationStatus, scope = "Agent slots only; Copilot CLI/auth/model not checked" },
+            statusCode: pool.IsReady ? StatusCodes.Status200OK : StatusCodes.Status503ServiceUnavailable));
 
         app.MapGet("/status", (WorkflowRunnerState state) => Results.Json(state.GetSnapshot()));
 
@@ -147,9 +156,11 @@ public static class SquadifyWebProgram
                 ?? "Checkout failures spiking on PaymentService. Error rate > 50%";
             var severity = request.Query["severity"].FirstOrDefault() ?? "Sev2";
             var demo = request.Query["demo"].FirstOrDefault() ?? "3";
+            if (!int.TryParse(demo, out var demoNumber) || demoNumber is < 1 or > 3)
+                return Results.BadRequest("Demo must be 1, 2, or 3");
 
             var incident = new SimulatedIncident(
-                Guid.NewGuid().ToString("n"), title, severity, int.Parse(demo), DateTimeOffset.UtcNow);
+                Guid.NewGuid().ToString("n"), title, severity, demoNumber, DateTimeOffset.UtcNow);
 
             return trigger.TryTrigger(incident)
                 ? Results.Accepted("/status", new { accepted = true, runId = incident.Id, snapshot = trigger.State.GetSnapshot() })
@@ -175,8 +186,6 @@ public static class SquadifyWebProgram
                 : Results.Conflict(trigger.State.GetSnapshot());
         });
 
-        await app.RunAsync();
-        return 0;
     }
 
     private static string? ReadOption(string[] args, string name)
@@ -302,13 +311,24 @@ public sealed class WorkflowRunnerState
         }
     }
 
+    public void MarkCancelled(SimulatedIncident incident)
+    {
+        if (_runs.TryGetValue(incident.Id, out var run))
+        {
+            run.Status = "Cancelled";
+            run.ExitCode = 130;
+            run.CompletedAt = DateTimeOffset.UtcNow;
+            run.Message = "Workflow cancelled.";
+        }
+    }
+
     public object GetSnapshot()
     {
         var all = _runs.Values.ToList();
         var active = all.Where(r => r.Status is "Queued" or "Running")
             .OrderBy(r => r.QueuedAt)
             .Select(ToDto).ToList();
-        var recent = all.Where(r => r.Status is "Completed" or "Failed")
+        var recent = all.Where(r => r.Status is "Completed" or "Failed" or "Cancelled")
             .OrderByDescending(r => r.CompletedAt)
             .Take(10)
             .Select(ToDto).ToList();
@@ -468,6 +488,16 @@ public sealed class WorkflowRunTrace
         }
     }
 
+    public void Cancel()
+    {
+        lock (_gate)
+        {
+            CompletedAt = DateTimeOffset.UtcNow;
+            FinalResult = "Workflow cancelled.";
+            Status = "Cancelled";
+        }
+    }
+
     public object ToSnapshot()
     {
         lock (_gate)
@@ -542,17 +572,27 @@ public sealed class WorkflowTriggeredRunner : BackgroundService
         // CONCURRENTLY instead of one-at-a-time. Squad-node concurrency is naturally
         // capped by the warm pool (RentAsync blocks when all agents are busy).
         var running = new List<Task>();
-        await foreach (var incident in _trigger.Incidents.ReadAllAsync(stoppingToken))
+        try
         {
-            var task = Task.Run(() => RunOneAsync(incident, stoppingToken), stoppingToken);
-            running.Add(task);
-            running.RemoveAll(t => t.IsCompleted);
+            await foreach (var incident in _trigger.Incidents.ReadAllAsync(stoppingToken))
+            {
+                var task = Task.Run(() => RunOneAsync(incident, stoppingToken));
+                running.Add(task);
+                running.RemoveAll(t => t.IsCompleted);
+            }
         }
-
-        await Task.WhenAll(running);
+        catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+        {
+            while (_trigger.Incidents.TryRead(out var queued))
+                running.Add(RunOneAsync(queued, stoppingToken));
+        }
+        finally
+        {
+            await Task.WhenAll(running);
+        }
     }
 
-    private async Task RunOneAsync(SimulatedIncident incident, CancellationToken stoppingToken)
+    internal async Task RunOneAsync(SimulatedIncident incident, CancellationToken stoppingToken)
     {
         _state.MarkRunning(incident);
         var runTrace = _traceStore.StartRun(incident);
@@ -567,7 +607,11 @@ public sealed class WorkflowTriggeredRunner : BackgroundService
 
         try
         {
+            stoppingToken.ThrowIfCancellationRequested();
             await RunDemoAsync(incident, runTrace, stoppingToken);
+            stoppingToken.ThrowIfCancellationRequested();
+            if (string.IsNullOrWhiteSpace(runTrace.FinalResult))
+                throw new InvalidOperationException("Workflow completed without final output.");
             runTrace.Complete(runTrace.FinalResult);
             var duration = Stopwatch.GetElapsedTime(started);
             _state.MarkCompleted(incident, runTrace.FinalResult);
@@ -579,9 +623,11 @@ public sealed class WorkflowTriggeredRunner : BackgroundService
         }
         catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
         {
-            runTrace.Complete("Cancelled");
-            _state.MarkCompleted(incident);
-            activity?.SetStatus(ActivityStatusCode.Ok);
+            runTrace.Cancel();
+            _state.MarkCancelled(incident);
+            activity?.SetTag("workflow.cancelled", true);
+            activity?.SetStatus(ActivityStatusCode.Error, "Workflow cancelled.");
+            _logger.LogInformation("Demo {Demo} cancelled for incident {Id}", incident.DemoNumber, incident.Id);
         }
         catch (Exception ex)
         {
@@ -597,27 +643,27 @@ public sealed class WorkflowTriggeredRunner : BackgroundService
         switch (incident.DemoNumber)
         {
             case 1:
-                await RunDemo1Async(incident, trace);
+                await RunDemo1Async(incident, trace, ct);
                 break;
             case 2:
-                await RunDemo2Async(incident, trace);
+                await RunDemo2Async(incident, trace, ct);
                 break;
             case 3:
             default:
-                await RunDemo3Async(incident, trace);
+                await RunDemo3Async(incident, trace, ct);
                 break;
         }
     }
 
     /// <summary>Demo 1: Single Agent with Tools</summary>
-    private async Task RunDemo1Async(SimulatedIncident incident, WorkflowRunTrace trace)
+    private async Task RunDemo1Async(SimulatedIncident incident, WorkflowRunTrace trace, CancellationToken ct)
     {
         _logger.LogInformation("━━━ Demo 1: Single Agent with Tools ━━━");
 
         var analyzer = IncidentWorkflow.CreateLogAnalyzer(_chatClient);
         var sb = new System.Text.StringBuilder();
 
-        await foreach (var update in analyzer.RunStreamingAsync(incident.Title))
+        await foreach (var update in analyzer.RunStreamingAsync(incident.Title, cancellationToken: ct))
         {
             if (!string.IsNullOrEmpty(update.Text))
             {
@@ -633,14 +679,14 @@ public sealed class WorkflowTriggeredRunner : BackgroundService
     }
 
     /// <summary>Demo 2: Sequential Workflow (Analyze → Remediate)</summary>
-    private async Task RunDemo2Async(SimulatedIncident incident, WorkflowRunTrace trace)
+    private async Task RunDemo2Async(SimulatedIncident incident, WorkflowRunTrace trace, CancellationToken ct)
     {
         _logger.LogInformation("━━━ Demo 2: Sequential Workflow (Analyze → Fix) ━━━");
 
         var pipeline = IncidentWorkflow.BuildSequentialPipeline(_chatClient);
         var sb = new System.Text.StringBuilder();
 
-        await foreach (var update in pipeline.RunStreamingAsync(incident.Title))
+        await foreach (var update in pipeline.RunStreamingAsync(incident.Title, cancellationToken: ct))
         {
             if (!string.IsNullOrEmpty(update.Text))
             {
@@ -660,10 +706,10 @@ public sealed class WorkflowTriggeredRunner : BackgroundService
     /// connected via WorkflowBuilder edges. This is the key demo showing Squad
     /// integrated as an executor node alongside deterministic code executors.
     /// </summary>
-    private async Task RunDemo3Async(SimulatedIncident incident, WorkflowRunTrace trace)
+    private async Task RunDemo3Async(SimulatedIncident incident, WorkflowRunTrace trace, CancellationToken ct)
     {
         _logger.LogInformation("━━━ Demo 3: Squadified MAF Workflow (WorkflowBuilder) ━━━");
-        _logger.LogInformation("  Building DAG: [Validator] → [SquadAnalysis] → [Enricher] → fan-out{Slack,PagerDuty,StatusPage} → barrier → [Aggregator]");
+        _logger.LogInformation("  Building DAG: [Validator] → [SquadAnalysis] → [Enricher] → fan-out{{Slack,PagerDuty,StatusPage}} → barrier → [Aggregator]");
 
         trace.AddStep("WorkflowBuilder", "Infrastructure", "Building MAF DAG: 7 executors, edges + fan-out + fan-in barrier, WithOpenTelemetry");
 
@@ -672,22 +718,22 @@ public sealed class WorkflowTriggeredRunner : BackgroundService
         // Rent a pre-warmed Squad agent from the pool (cold-start optimization).
         // RentAsync blocks when all pooled agents are busy → this is the concurrency cap
         // for the Squad node. The agent is returned in finally for the next run to reuse.
-        var pooled = await _pool.RentAsync();
+        var pooled = await _pool.RentAsync(ct);
         string result;
         try
         {
             result = await SquadifiedWorkflow.RunWorkflowAsync(
-                alertInput, _config.TeamRoot, _logger, _chatClient, pooled.Agent);
+                alertInput, _config.TeamRoot, _logger, _chatClient, pooled.Agent, ct);
         }
         finally
         {
             _pool.Return(pooled);
         }
 
-        trace.AddStep("AlertValidator", "MAF ChatClientAgent (Azure OpenAI)", "LLM classified alert severity");
+        trace.AddStep("AlertValidator", "MAF ChatClientAgent", "Configured chat client classified alert severity");
         trace.AddStep("SquadAnalysis", "Squad Agent node (Copilot CLI)", "Squad team analyzed via sub-agents");
         trace.AddStep("ContextEnricher", "Code executor (deterministic)", "Enriched with SLA/on-call data — intermediate output");
-        trace.AddStep("Notify (fan-out)", "3 code executors (deterministic)", "Slack + PagerDuty + StatusPage formatted in parallel");
+        trace.AddStep("Notify (fan-out)", "3 code executors (deterministic)", "Simulated Slack + PagerDuty + StatusPage messages formatted in parallel; not sent");
         trace.AddStep("Aggregator (fan-in barrier)", "Code executor", "Combined all channels → final workflow output");
 
         _logger.LogInformation("✅ Squadified MAF Workflow complete — all executors ran via edges.");
